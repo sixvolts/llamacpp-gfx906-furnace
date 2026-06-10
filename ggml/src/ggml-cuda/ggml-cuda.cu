@@ -5131,15 +5131,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     }
 
     // GCN-repacked weights support exactly one op shape: MUL_MAT as
-    // src0, 2D Q4_K, f32 src1/dst, unbatched src1. Anything else must be
-    // refused so the model loader never places a weight here that the
-    // graph would touch some other way.
+    // src0, 2D quantized weight, f32 src1/dst (3D/4D src1 broadcasts the
+    // weight per slice). Anything else must be refused so the model
+    // loader never places a weight here that the graph would touch some
+    // other way. NOTE: a rejection here after placement is fatal at
+    // schedule time (the weight cannot be copied out), so this gate and
+    // the dispatch in repack-gcn.cu must accept the same set.
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda_repack(op->src[i]->buffer->buft)) {
             if (op->op != GGML_OP_MUL_MAT || i != 0 ||
                 !ggml_cuda_repack_tensor_supported(op->src[0]) ||
-                op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
-                op->src[1]->ne[2] != 1 || op->src[1]->ne[3] != 1) {
+                op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
                 return false;
             }
         }
