@@ -512,11 +512,13 @@ static __global__ void mul_mat_vec_q6k_repacked(
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
-// Q8_0 repacked matvec — single wave64 per block, ROWS output rows.
-// ROWS=2 wins mid-size out_dim; ROWS=1 doubles the wavefront count and
-// wins at out_dim >= 4096 where ROWS=2 leaves too few wavefront
-// generations in flight to sustain HBM bandwidth.
-template <int ROWS>
+// Q8_0 repacked matvec — NWAVES wave64s per block, ROWS output rows
+// per wave. The original reinstinct tuning used single-wave blocks
+// (NWAVES=1) for its MoE-expert shapes; small dense models want the
+// 4-wave shape the K-quant matvecs use (NWAVES=4). ROWS=1 doubles the
+// wavefront count and wins at out_dim >= 4096 where ROWS=2 leaves too
+// few wavefront generations in flight to sustain HBM bandwidth.
+template <int ROWS, int NWAVES>
 static __global__ void mul_mat_vec_q8_0_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1) {
@@ -528,15 +530,24 @@ static __global__ void mul_mat_vec_q8_0_repacked(
     const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(
         wbase + (size_t) ne1 * nsp * 32);
 
-    const int row0 = blockIdx.x * ROWS;
-    const int lane = threadIdx.x;
+    const int wave = threadIdx.x >> 6;
+    const int row0 = blockIdx.x * (ROWS * NWAVES) + wave * ROWS;
+    const int lane = threadIdx.x & 63;
 
     float acc[ROWS] = {};
 
-    for (uint32_t sb = lane; sb < n_blocks; sb += 64) {
+    // Work unit: a 16-weight half sub-block (4 sdot4s). At small ne0 a
+    // full-sub-block unit leaves lanes idle (ne0=1024 -> 32 sub-blocks
+    // for 64 lanes); halves keep the wave full down to ne0=1024.
+    // (8-weight quarters were tried and regress: 4x the d-plane traffic
+    // outweighs the extra balance.)
+    const uint32_t n_half = n_blocks * 2;
+    for (uint32_t hb = lane; hb < n_half; hb += 64) {
+        const uint32_t sb   = hb >> 1;
+        const uint32_t half = hb & 1;
         const block_q8_1 * xb = xq + sb;
         const float dx = __low2float(xb->ds);
-        const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+        const int * xq32 = reinterpret_cast<const int *>(xb->qs) + half * 4;
 
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
@@ -544,13 +555,13 @@ static __global__ void mul_mat_vec_q8_0_repacked(
             if (row >= (int) ne1) {
                 continue;
             }
-            const int      * w_int = qs_int + ((size_t) row * nsp + sb) * 8;
+            const int      * w_int = qs_int + ((size_t) row * nsp + sb) * 8 + half * 4;
             const uint16_t   db    = d_plane[(size_t) row * nsp + sb];
             const float      dw    = __half2float(*reinterpret_cast<const __half *>(&db));
 
             int idot = 0;
 #pragma unroll
-            for (int g = 0; g < 8; g++) {
+            for (int g = 0; g < 4; g++) {
                 idot = ggml_cuda_dp4a(w_int[g], xq32[g], idot);
             }
             acc[r] += dw * dx * (float) idot;
@@ -1121,16 +1132,23 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01);
             } break;
             case GGML_TYPE_Q8_0: {
-                // single wave64 per block; ROWS=1 doubles the wavefront
-                // count and wins at large ne01 (measured on gfx906:
-                // ROWS=2 at ne01=4096 stalls ~184 GB/s, ROWS=1 ~2x it)
+                // large ne01: single-wave ROWS=1 blocks maximize the
+                // wavefront count (measured on gfx906: ROWS=2 at
+                // ne01=4096 stalls ~184 GB/s, ROWS=1 ~2x it). Small
+                // ne01: 4-wave ROWS=2 blocks (the K-quant matvec shape).
                 if (ne01 >= 4096) {
                     const dim3 grid(ne01, 1, 1);
-                    mul_mat_vec_q8_0_repacked<1><<<grid, 64, 0, stream>>>(
+                    mul_mat_vec_q8_0_repacked<1, 1><<<grid, 64, 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01);
                 } else {
-                    const dim3 grid((ne01 + 1) / 2, 1, 1);
-                    mul_mat_vec_q8_0_repacked<2><<<grid, 64, 0, stream>>>(
+                    // 4-wave ROWS=2 with half-sub-block work units is the
+                    // best of the swept variants (gfx906, 0.8B-Q8_0 tg128:
+                    // 231.0 vs 222.7 single-wave, 222.2 full-block units,
+                    // 219.9 ROWS=4, 214.2 quarter units; canonical mmvq
+                    // is 238.0 — the residual ~3% is why Q8_0 stays
+                    // behind its own env gate)
+                    const dim3 grid((ne01 + 7) / 8, 1, 1);
+                    mul_mat_vec_q8_0_repacked<2, 4><<<grid, 256, 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01);
                 }
             } break;
