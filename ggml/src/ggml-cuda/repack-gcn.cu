@@ -4,6 +4,7 @@
 
 #include "ggml-backend-impl.h"
 #include "mmid.cuh"
+#include "unary.cuh"
 
 #include <cstdlib>
 #include <cstring>
@@ -44,22 +45,6 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // 2D weights (MUL_MAT) or 3D per-expert stacks (MUL_MAT_ID)
     if ((ggml_n_dims(t) != 2 && ggml_n_dims(t) != 3) || !ggml_is_contiguous(t)) {
         return false;
-    }
-    if (ggml_n_dims(t) == 3) {
-        // Expert stacks are their own opt-in: the grouped MMQ wins MoE
-        // prefill (+12% on 35B-A3B) but the per-assignment matvec loses
-        // ~7% decode to canonical mmvq-id — expert tensors are small-K
-        // (down-proj K=768 -> 24 sub-blocks for 64 lanes, 62% of each
-        // wave idle). Fix before default-on: half-sub-block work units
-        // in the ID matvec path, with the -deff*sx min term applied by
-        // the even half only.
-        static const bool moe = [] {
-            const char * e = getenv("GGML_CUDA_REPACK_MOE");
-            return e != nullptr && e[0] != '0';
-        }();
-        if (!moe) {
-            return false;
-        }
     }
     switch (t->type) {
         case GGML_TYPE_Q4_K:
@@ -342,11 +327,15 @@ static __global__ void mul_mat_vec_q4k_repacked(
         const size_t expert_stride, const uint32_t xs_id, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(GCN)
     if constexpr (HAS_IDS) {
+        // decode (one token): slot a maps directly — expert ids_raw[a],
+        // activation column a, dst column a. No compaction kernel needed
+        // (ids_src1 carries the RAW ids tensor here).
         const uint32_t a = blockIdx.y;
-        const uint32_t e = repack_find_expert(expert_bounds, n_expert, a);
+        const uint32_t e = (uint32_t) ids_src1[a];
         wbase += e * expert_stride;
-        xq    += (size_t) ids_src1[a] * xs_id;
-        y     += (size_t) ids_dst[a]  * dst_s1;
+        xq    += (size_t) a * xs_id;
+        y     += (size_t) a * dst_s1;
+        GGML_UNUSED_VARS(ids_dst, expert_bounds, n_expert);
     } else {
         GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, n_expert, expert_stride, xs_id, dst_s1);
     }
@@ -446,11 +435,15 @@ static __global__ void mul_mat_vec_q5k_repacked(
         const size_t expert_stride, const uint32_t xs_id, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(GCN)
     if constexpr (HAS_IDS) {
+        // decode (one token): slot a maps directly — expert ids_raw[a],
+        // activation column a, dst column a. No compaction kernel needed
+        // (ids_src1 carries the RAW ids tensor here).
         const uint32_t a = blockIdx.y;
-        const uint32_t e = repack_find_expert(expert_bounds, n_expert, a);
+        const uint32_t e = (uint32_t) ids_src1[a];
         wbase += e * expert_stride;
-        xq    += (size_t) ids_src1[a] * xs_id;
-        y     += (size_t) ids_dst[a]  * dst_s1;
+        xq    += (size_t) a * xs_id;
+        y     += (size_t) a * dst_s1;
+        GGML_UNUSED_VARS(ids_dst, expert_bounds, n_expert);
     } else {
         GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, n_expert, expert_stride, xs_id, dst_s1);
     }
@@ -541,11 +534,15 @@ static __global__ void mul_mat_vec_q6k_repacked(
         const size_t expert_stride, const uint32_t xs_id, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(GCN)
     if constexpr (HAS_IDS) {
+        // decode (one token): slot a maps directly — expert ids_raw[a],
+        // activation column a, dst column a. No compaction kernel needed
+        // (ids_src1 carries the RAW ids tensor here).
         const uint32_t a = blockIdx.y;
-        const uint32_t e = repack_find_expert(expert_bounds, n_expert, a);
+        const uint32_t e = (uint32_t) ids_src1[a];
         wbase += e * expert_stride;
-        xq    += (size_t) ids_src1[a] * xs_id;
-        y     += (size_t) ids_dst[a]  * dst_s1;
+        xq    += (size_t) a * xs_id;
+        y     += (size_t) a * dst_s1;
+        GGML_UNUSED_VARS(ids_dst, expert_bounds, n_expert);
     } else {
         GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, n_expert, expert_stride, xs_id, dst_s1);
     }
@@ -647,11 +644,15 @@ static __global__ void mul_mat_vec_q8_0_repacked(
         const size_t expert_stride, const uint32_t xs_id, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(GCN)
     if constexpr (HAS_IDS) {
+        // decode (one token): slot a maps directly — expert ids_raw[a],
+        // activation column a, dst column a. No compaction kernel needed
+        // (ids_src1 carries the RAW ids tensor here).
         const uint32_t a = blockIdx.y;
-        const uint32_t e = repack_find_expert(expert_bounds, n_expert, a);
+        const uint32_t e = (uint32_t) ids_src1[a];
         wbase += e * expert_stride;
-        xq    += (size_t) ids_src1[a] * xs_id;
-        y     += (size_t) ids_dst[a]  * dst_s1;
+        xq    += (size_t) a * xs_id;
+        y     += (size_t) a * dst_s1;
+        GGML_UNUSED_VARS(ids_dst, expert_bounds, n_expert);
     } else {
         GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, n_expert, expert_stride, xs_id, dst_s1);
     }
@@ -709,6 +710,110 @@ static __global__ void mul_mat_vec_q8_0_repacked(
     }
 #else
     GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, ids_src1, ids_dst, expert_bounds, n_expert, expert_stride, xs_id, dst_s1);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+
+// Fused gate+up Q4_K matvec with GLU epilogue. Walks BOTH weight slabs
+// in one sub-block loop (one activation read, one launch) and writes
+// y[row] = glu(gate_dot) * up_dot — replacing two matvec launches plus
+// an elementwise GLU op. This is what canonical mmvq fuses too; without
+// it the repacked MoE decode pays ~2x the launches (measured -7% on
+// 35B-A3B). Used for both dense MUL_MAT (ids == nullptr) and
+// MUL_MAT_ID decode. ID path uses half-sub-block units (small-K expert
+// tensors; min term on the even half).
+template <bool HAS_IDS>
+static __global__ void mul_mat_vec_q4k_repacked_glu(
+        const uint8_t * __restrict__ wup, const uint8_t * __restrict__ wgate,
+        const block_q8_1 * __restrict__ xq, float * __restrict__ y,
+        const uint32_t ne0, const uint32_t ne1, const int glu_op,
+        const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, const uint32_t n_expert,
+        const size_t expert_stride, const uint32_t xs_id, const uint32_t dst_s1) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    if constexpr (HAS_IDS) {
+        const uint32_t a = blockIdx.y; // slot index; see direct-map note above
+        const uint32_t e = (uint32_t) ids_src1[a];
+        wup   += e * expert_stride;
+        wgate += e * expert_stride;
+        xq    += (size_t) a * xs_id;
+        y     += (size_t) a * dst_s1;
+        GGML_UNUSED_VARS(ids_dst, expert_bounds, n_expert);
+    } else {
+        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, n_expert, expert_stride, xs_id, dst_s1);
+    }
+    constexpr int ROWS = 2;
+    const int wave = threadIdx.x >> 6;
+    const int lane = threadIdx.x & 63;
+    const int row0 = blockIdx.x * (ROWS * 4) + wave * ROWS;
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    const uint32_t n_super = n_sub >> 3;
+
+    const uint8_t * wb[2] = { wup, wgate };
+    float acc[2][ROWS] = {};
+
+    const uint32_t n_unit = HAS_IDS ? n_sub * 2 : n_sub;
+    for (uint32_t u = lane; u < n_unit; u += 64) {
+        const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
+        const uint32_t half = HAS_IDS ? (u & 1)  : 0;
+        const block_q8_1 * xb = xq + sb;
+        const float dx = __low2float(xb->ds);
+        const float sx = __high2float(xb->ds);
+        const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+
+#pragma unroll
+        for (int w2 = 0; w2 < 2; w2++) {
+            const uint4    * nib = reinterpret_cast<const uint4 *>(wb[w2]);
+            const uint16_t * smp = reinterpret_cast<const uint16_t *>(
+                wb[w2] + (size_t) ne1 * nsp * 16);
+            const uint32_t * ddp = reinterpret_cast<const uint32_t *>(
+                wb[w2] + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 2);
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const int row = row0 + r;
+                if (row >= (int) ne1) {
+                    continue;
+                }
+                const uint4    q  = nib[(size_t) row * nsp + sb];
+                const uint16_t sm = smp[(size_t) row * nsp + sb];
+                const uint32_t dd = ddp[(size_t) row * n_super + (sb >> 3)];
+                const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
+                const uint16_t dmin_bits = (uint16_t)(dd >> 16);
+                const float dsc  = __half2float(*reinterpret_cast<const __half *>(&d_bits))
+                                   * (float)(sm & 0xFFu);
+                const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits))
+                                   * (float)(sm >> 8);
+
+                const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+                const int j0 = HAS_IDS ? (int)(half * 2) : 0;
+                const int j1 = HAS_IDS ? j0 + 2          : 4;
+                int idot = 0;
+#pragma unroll
+                for (int j = j0; j < j1; j++) {
+                    idot = ggml_cuda_dp4a((int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot);
+                    idot = ggml_cuda_dp4a((int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot);
+                }
+                acc[w2][r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const float up_v   = warp_reduce_sum<64>(acc[0][r]);
+        const float gate_v = warp_reduce_sum<64>(acc[1][r]);
+        if (lane == 0 && (row0 + r) < (int) ne1) {
+            const float g = glu_op == (int) GGML_GLU_OP_SWIGLU
+                ? ggml_cuda_op_silu_single(gate_v)
+                : ggml_cuda_op_gelu_single(gate_v);
+            y[row0 + r] = g * up_v;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wup, wgate, xq, y, ne0, ne1, glu_op, ids_src1, ids_dst,
+                     expert_bounds, n_expert, expert_stride, xs_id, dst_s1);
     NO_DEVICE_CODE;
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
@@ -1487,7 +1592,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
-    {
+    if (n_tokens > 1) {
         const int si1  = ids->nb[1] / sizeof(int32_t);
         const int sis1 = src1->nb[2] / src1->nb[1];
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data,
@@ -1511,42 +1616,46 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const block_q8_1 * xq = (const block_q8_1 *) src1_q8_1.get();
 
     if (n_tokens == 1) {
-        // decode: one matvec per (token, slot) assignment
+        // decode: one matvec per slot; experts read directly from the
+        // raw ids tensor in-kernel (no compaction kernels — launch
+        // parity with canonical mmvq-id). Broadcast src1 (ne[1]==1, one
+        // shared activation column for all slots) uses x-stride 0.
+        const uint32_t xs_eff = src1->ne[1] == 1 ? 0u : (uint32_t) x_stride;
         switch (src0->type) {
             case GGML_TYPE_Q4_K: {
                 const dim3 grid((ne01 + 7) / 8, n_assign, 1);
                 mul_mat_vec_q4k_repacked<true><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-                    (uint32_t) ne02, expert_stride, (uint32_t) x_stride, dst_s1);
+                    (const int32_t *) ids->data, nullptr, nullptr,
+                    (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
             } break;
             case GGML_TYPE_Q5_K: {
                 const dim3 grid((ne01 + 7) / 8, n_assign, 1);
                 mul_mat_vec_q5k_repacked<true><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-                    (uint32_t) ne02, expert_stride, (uint32_t) x_stride, dst_s1);
+                    (const int32_t *) ids->data, nullptr, nullptr,
+                    (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
             } break;
             case GGML_TYPE_Q6_K: {
                 const dim3 grid((ne01 + 7) / 8, n_assign, 1);
                 mul_mat_vec_q6k_repacked<true><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-                    (uint32_t) ne02, expert_stride, (uint32_t) x_stride, dst_s1);
+                    (const int32_t *) ids->data, nullptr, nullptr,
+                    (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
             } break;
             case GGML_TYPE_Q8_0: {
                 if (ne01 >= 4096) {
                     const dim3 grid(ne01, n_assign, 1);
                     mul_mat_vec_q8_0_repacked<1, 1, true><<<grid, 64, 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                        ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-                        (uint32_t) ne02, expert_stride, (uint32_t) x_stride, dst_s1);
+                        (const int32_t *) ids->data, nullptr, nullptr,
+                        (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
                 } else {
                     const dim3 grid((ne01 + 7) / 8, n_assign, 1);
                     mul_mat_vec_q8_0_repacked<2, 4, true><<<grid, 256, 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                        ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-                        (uint32_t) ne02, expert_stride, (uint32_t) x_stride, dst_s1);
+                        (const int32_t *) ids->data, nullptr, nullptr,
+                        (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
                 }
             } break;
             default: GGML_ABORT("unsupported repack type");
@@ -1590,6 +1699,89 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
             break;
         default: GGML_ABORT("unsupported repack type");
     }
+}
+
+// Eligibility for the fused gate+up GLU path: both weights in the
+// repack buffer type, Q4_K, identical shape; decode only (one output
+// column per expert slot); SWIGLU or GEGLU.
+bool ggml_cuda_repack_should_fuse_glu(const ggml_tensor * up, const ggml_tensor * gate,
+        const ggml_tensor * glu) {
+    const ggml_tensor * wu = up->src[0];
+    const ggml_tensor * wg = gate->src[0];
+    if (wu->buffer == nullptr || wg->buffer == nullptr ||
+        !ggml_backend_buft_is_cuda_repack(wu->buffer->buft) ||
+        !ggml_backend_buft_is_cuda_repack(wg->buffer->buft)) {
+        return false;
+    }
+    if (wu->type != GGML_TYPE_Q4_K || wg->type != GGML_TYPE_Q4_K ||
+        !ggml_are_same_shape(wu, wg)) {
+        return false;
+    }
+    const ggml_glu_op op = ggml_get_glu_op(glu);
+    if (op != GGML_GLU_OP_SWIGLU && op != GGML_GLU_OP_GEGLU) {
+        return false;
+    }
+    if (up->src[2] != nullptr) { // MUL_MAT_ID: one token
+        return up->src[1]->ne[2] == 1 && glu->ne[2] == 1;
+    }
+    return up->src[1]->ne[1] == 1; // dense: one column
+}
+
+void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * up_w, const ggml_tensor * gate_w,
+        const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const int glu_op) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+
+    const int64_t ne00 = up_w->ne[0];
+    const int64_t ne01 = up_w->ne[1];
+    cudaStream_t stream = ctx.stream();
+    const uint8_t * wu = (const uint8_t *) up_w->data;
+    const uint8_t * wg = (const uint8_t *) gate_w->data;
+    float * dst_d = (float *) dst->data;
+
+    const int64_t ne10_padded = GGML_PAD(ne00, MATRIX_ROW_PADDING);
+    const int64_t x_stride    = ne10_padded / QK8_1;
+
+    if (ids == nullptr) {
+        // dense decode column
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(),
+            ne10_padded * sizeof(block_q8_1) / QK8_1);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
+            up_w->type, ne00, ne00, ne00, ne00, ne10_padded, 1, 1, 1, stream);
+        const dim3 grid((ne01 + 7) / 8, 1, 1);
+        mul_mat_vec_q4k_repacked_glu<false><<<grid, 256, 0, stream>>>(
+            wu, wg, (const block_q8_1 *) src1_q8_1.get(), dst_d,
+            (uint32_t) ne00, (uint32_t) ne01, glu_op,
+            nullptr, nullptr, nullptr, 0, 0, 0, 0);
+        return;
+    }
+
+    // MoE decode: same routing machinery as the unfused ID path
+    const int64_t ne02 = up_w->ne[2];
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t n_assign = n_expert_used; // one token
+    const size_t expert_stride = repack_gcn_nbytes(up_w->type, ne00, ne01);
+    GGML_ASSERT(dst->nb[1] == (size_t) dst->ne[0] * sizeof(float));
+    const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
+
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(),
+        src1->ne[1] * ne10_padded * sizeof(block_q8_1) / QK8_1);
+    {
+        const int64_t s11 = src1->nb[1] / sizeof(float);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
+            up_w->type, ne00, s11, s11 * src1->ne[1], s11 * src1->ne[1],
+            ne10_padded, src1->ne[1], 1, 1, stream);
+    }
+    const uint32_t xs_eff = src1->ne[1] == 1 ? 0u : (uint32_t) x_stride;
+    const dim3 grid((ne01 + 7) / 8, n_assign, 1);
+    mul_mat_vec_q4k_repacked_glu<true><<<grid, 256, 0, stream>>>(
+        wu, wg, (const block_q8_1 *) src1_q8_1.get(), dst_d,
+        (uint32_t) ne00, (uint32_t) ne01, glu_op,
+        (const int32_t *) ids->data, nullptr, nullptr,
+        (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
 }
 
 // ---------------------------------------------------------------------
@@ -1697,8 +1889,11 @@ ggml_backend_buffer_type_t ggml_backend_cuda_repack_buffer_type(int device) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
 
+    // Default-on for GCN; GGML_CUDA_REPACK=0 opts out. (Repacked
+    // weights cannot be read back: llama-quantize/save from a loaded
+    // model needs the opt-out.)
     const char * env = getenv("GGML_CUDA_REPACK");
-    if (env == nullptr || env[0] == '0') {
+    if (env != nullptr && env[0] == '0') {
         return nullptr;
     }
     if (device >= ggml_backend_cuda_get_device_count()) {

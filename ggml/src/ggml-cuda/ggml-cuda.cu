@@ -4171,6 +4171,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
 
+            if (ggml_cuda_repack_should_fuse_glu(up, gate, glu)) {
+                ggml_cuda_mul_mat_repacked_fused_glu(*cuda_ctx, up->src[0], gate->src[0],
+                    src1, ids, glu, (int) ggml_get_glu_op(glu));
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
