@@ -37,6 +37,14 @@ ggml_backend_buffer_type_t ggml_backend_cuda_repack_buffer_type(int device);
 bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t);
 
 // MUL_MAT with src0 in the repack buffer type. ne11 == 1 runs the
-// repacked dp4a matvec; larger ne11 dequantizes to fp16 and runs GEMM.
+// repacked dp4a matvec; larger ne11 runs the repacked int8 MMQ GEMM.
+// 3D/4D src1 broadcasts the 2D weight per slice.
 void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+// MUL_MAT_ID with 3D src0 (per-expert repacked slabs) in the repack
+// buffer type. Decode (one token) runs one matvec per assignment;
+// batches run a grouped tile GEMM over expert-sorted assignments.
+void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+    ggml_tensor * dst);

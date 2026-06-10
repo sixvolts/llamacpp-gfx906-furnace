@@ -2695,6 +2695,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
+    // GCN-repacked expert stacks take their own path (see repack-gcn.cu)
+    if (src0->buffer != nullptr && ggml_backend_buft_is_cuda_repack(src0->buffer->buft)) {
+        ggml_cuda_mul_mat_id_repacked(ctx, src0, src1, ids, dst);
+        return;
+    }
+
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ggml_backend_buft_is_cuda_split(src0->buffer->buft) && "mul_mat_id does not support split buffers");
@@ -5139,7 +5145,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     // the dispatch in repack-gcn.cu must accept the same set.
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda_repack(op->src[i]->buffer->buft)) {
-            if (op->op != GGML_OP_MUL_MAT || i != 0 ||
+            const bool ok_mm   = op->op == GGML_OP_MUL_MAT    && i == 0 &&
+                                 ggml_n_dims(op->src[0]) == 2;
+            const bool ok_mmid = op->op == GGML_OP_MUL_MAT_ID && i == 0 &&
+                                 ggml_n_dims(op->src[0]) == 3 &&
+                                 op->src[2] != nullptr && op->src[2]->type == GGML_TYPE_I32;
+            if (!(ok_mm || ok_mmid) ||
                 !ggml_cuda_repack_tensor_supported(op->src[0]) ||
                 op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
                 return false;
