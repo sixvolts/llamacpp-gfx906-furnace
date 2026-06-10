@@ -179,6 +179,143 @@ static __global__ void mul_mat_vec_q4k_repacked(
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
+// int8 MMQ tile GEMM straight from the repacked planes (prefill path).
+// Y[tok, row] = Xq8[tok, :] . W[row, :] without dequantizing W.
+//
+// A workgroup (256 threads as a 16x16 grid) computes a BM x BN output
+// tile (BM = 64 weight rows, BN = 64 tokens), walking the contraction
+// in BK = 4 sub-block chunks staged through LDS. Thread (tx,ty) owns a
+// strided 4x4 register micro-tile (rows ty, ty+16, ..., tokens tx,
+// tx+16, ...) so a wavefront's 16 token reads land on 16 distinct LDS
+// banks (block_q8_1 stride is 36 B = 9 words; gcd(9,32)=1).
+//
+// Tile shape carried from the production kernel in reinstinct, where a
+// sweep (BK in {4,8}, TM/TN in {4,8}, occupancy 1/2) found 4x4 at
+// occupancy 2 flat-optimal on gfx906.
+#define MMQ_RP_BK 4
+#define MMQ_RP_TM 4
+#define MMQ_RP_TN 4
+#define MMQ_RP_BM (16 * MMQ_RP_TM)
+#define MMQ_RP_BN (16 * MMQ_RP_TN)
+
+static __global__ void __launch_bounds__(256, 2) mmq_gemm_q4k_repacked(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const uint32_t n_tok, const uint32_t x_stride) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const int t  = threadIdx.x;
+    const int tx = t & 15;
+    const int ty = t >> 4;
+    const uint32_t row0 = blockIdx.x * MMQ_RP_BM;
+    const uint32_t tok0 = blockIdx.y * MMQ_RP_BN;
+
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    const uint32_t n_super = n_sub >> 3;
+    const uint4    * nib = reinterpret_cast<const uint4 *>(wbase);
+    const uint16_t * smp = reinterpret_cast<const uint16_t *>(
+        wbase + (size_t) ne1 * nsp * 16);
+    const uint32_t * ddp = reinterpret_cast<const uint32_t *>(
+        wbase + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 2);
+
+    __shared__ uint4      sW [MMQ_RP_BM][MMQ_RP_BK];     // packed nibbles
+    __shared__ float2     sWs[MMQ_RP_BM][MMQ_RP_BK];     // (dsc, deff)
+    __shared__ block_q8_1 sX [MMQ_RP_BN][MMQ_RP_BK + 1]; // int8 activations
+
+    float acc[MMQ_RP_TM][MMQ_RP_TN] = {};
+
+    constexpr int LDW = MMQ_RP_BM * MMQ_RP_BK / 256; // tile elems per thread
+    constexpr int LDX = MMQ_RP_BN * MMQ_RP_BK / 256;
+
+    for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_BK) {
+#pragma unroll
+        for (int i = 0; i < LDW; i++) {
+            const int e  = t + i * 256;
+            const int lr = e / MMQ_RP_BK, lk = e % MMQ_RP_BK;
+            const uint32_t wrow = row0 + lr;
+            const uint32_t sb   = sb0 + lk;
+            if (wrow < ne1 && sb < n_sub) {
+                sW[lr][lk] = nib[(size_t) wrow * nsp + sb];
+                const uint16_t sm = smp[(size_t) wrow * nsp + sb];
+                const uint32_t dd = ddp[(size_t) wrow * n_super + (sb >> 3)];
+                const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
+                const uint16_t dmin_bits = (uint16_t)(dd >> 16);
+                sWs[lr][lk] = make_float2(
+                    __half2float(*reinterpret_cast<const __half *>(&d_bits))
+                        * (float)(sm & 0xFFu),
+                    __half2float(*reinterpret_cast<const __half *>(&dmin_bits))
+                        * (float)(sm >> 8));
+            } else {
+                sWs[lr][lk] = make_float2(0.0f, 0.0f);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < LDX; i++) {
+            const int e  = t + i * 256;
+            const int lr = e / MMQ_RP_BK, lk = e % MMQ_RP_BK;
+            const uint32_t xtok = tok0 + lr;
+            const uint32_t sb   = sb0 + lk;
+            if (xtok < n_tok && sb < n_sub) {
+                sX[lr][lk] = xq[(size_t) xtok * x_stride + sb];
+            } else {
+                sX[lr][lk].ds = make_half2(0.0f, 0.0f);
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int kk = 0; kk < MMQ_RP_BK; kk++) {
+            uint4 wq[MMQ_RP_TM];
+            float dsc[MMQ_RP_TM], deff[MMQ_RP_TM];
+#pragma unroll
+            for (int r = 0; r < MMQ_RP_TM; r++) {
+                wq[r] = sW[ty + r * 16][kk];
+                const float2 s = sWs[ty + r * 16][kk];
+                dsc[r]  = s.x;
+                deff[r] = s.y;
+            }
+#pragma unroll
+            for (int n = 0; n < MMQ_RP_TN; n++) {
+                const block_q8_1 * xb = &sX[tx + n * 16][kk];
+                const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+                const float dx = __low2float(xb->ds);
+                const float sx = __high2float(xb->ds);
+#pragma unroll
+                for (int r = 0; r < MMQ_RP_TM; r++) {
+                    const uint32_t qa[4] = { wq[r].x, wq[r].y, wq[r].z, wq[r].w };
+                    int idot = 0;
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        idot = ggml_cuda_dp4a((int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot);
+                        idot = ggml_cuda_dp4a((int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot);
+                    }
+                    acc[r][n] += dsc[r] * dx * (float) idot - deff[r] * sx;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < MMQ_RP_TM; r++) {
+        const uint32_t row = row0 + ty + r * 16;
+        if (row >= ne1) {
+            continue;
+        }
+#pragma unroll
+        for (int n = 0; n < MMQ_RP_TN; n++) {
+            const uint32_t tok = tok0 + tx + n * 16;
+            if (tok < n_tok) {
+                y[(size_t) tok * ne1 + row] = acc[r][n];
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
 // Repacked Q4_K -> fp16 row-major [ne1][ne0], for the GEMM path.
 // grid = ne1 * (ne0/32) sub-blocks, block = 32 (one thread per weight).
 static __global__ void dequant_q4k_repacked_f16(
@@ -252,8 +389,32 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         return;
     }
 
-    // prefill: dequantize the repacked weight to fp16 and GEMM.
-    // (interim — the repacked int8 MMQ tile GEMM is the phase-2 follow-up)
+    // prefill: int8 MMQ tile GEMM straight from the repacked planes.
+    static const bool no_mmq = [] {
+        const char * e = getenv("GGML_CUDA_REPACK_NO_MMQ");
+        return e != nullptr && e[0] != '0';
+    }();
+    if (!no_mmq) {
+        const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+        const int64_t x_stride    = ne10_padded / QK8_1; // q8_1 blocks per token
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(),
+            ne11 * ne10_padded * sizeof(block_q8_1) / QK8_1);
+        {
+            const int64_t s11 = src1->nb[1] / sizeof(float);
+            quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
+                src0->type, ne10, s11, s11 * ne11, s11 * ne11, ne10_padded, ne11, 1, 1, stream);
+        }
+
+        const dim3 grid((ne01 + MMQ_RP_BM - 1) / MMQ_RP_BM,
+                        (ne11 + MMQ_RP_BN - 1) / MMQ_RP_BN, 1);
+        mmq_gemm_q4k_repacked<<<grid, 256, 0, stream>>>(
+            w, (const block_q8_1 *) src1_q8_1.get(), dst_d,
+            (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride);
+        return;
+    }
+
+    // debug fallback (GGML_CUDA_REPACK_NO_MMQ=1): dequantize the
+    // repacked weight to fp16 and GEMM
     ggml_cuda_pool_alloc<half> w_f16(ctx.pool(), (size_t) ne00 * ne01);
     {
         const int64_t n_sub = ne00 / 32;
