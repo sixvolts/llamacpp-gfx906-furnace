@@ -366,7 +366,14 @@ static __global__ void mul_mat_vec_q4k_repacked(
 
     float acc[ROWS] = {0.0f, 0.0f};
 
-    for (uint32_t sb = lane; sb < n_sub; sb += 64) {
+    // ID path (experts) uses 16-weight half-sub-block units: expert
+    // tensors are small-K (down-proj K=768 -> 24 sub-blocks for 64
+    // lanes) and full units leave most of the wave idle. The -deff*sx
+    // min term is applied by the even half only.
+    const uint32_t n_unit = HAS_IDS ? n_sub * 2 : n_sub;
+    for (uint32_t u = lane; u < n_unit; u += 64) {
+        const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
+        const uint32_t half = HAS_IDS ? (u & 1)  : 0;
         const block_q8_1 * xb = xq + sb;
         const float dx = __low2float(xb->ds);
         const float sx = __high2float(xb->ds);
@@ -390,13 +397,15 @@ static __global__ void mul_mat_vec_q4k_repacked(
                                * (float)(sm >> 8);
 
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+            const int j0 = HAS_IDS ? (int)(half * 2) : 0;
+            const int j1 = HAS_IDS ? j0 + 2          : 4;
             int idot = 0;
 #pragma unroll
-            for (int j = 0; j < 4; j++) {
+            for (int j = j0; j < j1; j++) {
                 idot = ggml_cuda_dp4a((int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot);
                 idot = ggml_cuda_dp4a((int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot);
             }
-            acc[r] += dsc * dx * (float) idot - deff * sx;
+            acc[r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
         }
     }
 
@@ -463,7 +472,10 @@ static __global__ void mul_mat_vec_q5k_repacked(
 
     float acc[ROWS] = {0.0f, 0.0f};
 
-    for (uint32_t sb = lane; sb < n_sub; sb += 64) {
+    const uint32_t n_unit = HAS_IDS ? n_sub * 2 : n_sub; // see Q4_K note
+    for (uint32_t u = lane; u < n_unit; u += 64) {
+        const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
+        const uint32_t half = HAS_IDS ? (u & 1)  : 0;
         const block_q8_1 * xb = xq + sb;
         const float dx = __low2float(xb->ds);
         const float sx = __high2float(xb->ds);
@@ -488,9 +500,11 @@ static __global__ void mul_mat_vec_q5k_repacked(
                                * (float)(sm >> 8);
 
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+            const int j0 = HAS_IDS ? (int)(half * 2) : 0;
+            const int j1 = HAS_IDS ? j0 + 2          : 4;
             int idot = 0;
 #pragma unroll
-            for (int j = 0; j < 4; j++) {
+            for (int j = j0; j < j1; j++) {
                 const uint32_t lo = ( qa[j]       & 0x0F0F0F0Fu)
                     | repack_spread4((qh >> (8 * j))     & 0xFu);
                 const uint32_t hi = ((qa[j] >> 4) & 0x0F0F0F0Fu)
@@ -498,7 +512,7 @@ static __global__ void mul_mat_vec_q5k_repacked(
                 idot = ggml_cuda_dp4a((int) lo, xq32[j],     idot);
                 idot = ggml_cuda_dp4a((int) hi, xq32[j + 4], idot);
             }
-            acc[r] += dsc * dx * (float) idot - deff * sx;
+            acc[r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
         }
     }
 
@@ -553,14 +567,20 @@ static __global__ void mul_mat_vec_q6k_repacked(
 
     float acc[ROWS] = {0.0f, 0.0f};
 
-    for (uint32_t sb = lane; sb < n_sub; sb += 64) {
+    const uint32_t n_unit = HAS_IDS ? n_sub * 2 : n_sub; // see Q4_K note
+    for (uint32_t u = lane; u < n_unit; u += 64) {
+        const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
+        const uint32_t half = HAS_IDS ? (u & 1)  : 0;
+        const int hj0 = HAS_IDS ? (int)(half * 2) : 0;
+        const int hj1 = HAS_IDS ? hj0 + 2         : 4;
         const block_q8_1 * xb = xq + sb;
         const float dx = __low2float(xb->ds);
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
+        // per-half activation sums: the -32 fold splits with them
         int xis0 = 0, xis1 = 0;
 #pragma unroll
-        for (int j = 0; j < 4; j++) {
+        for (int j = hj0; j < hj1; j++) {
             xis0 = ggml_cuda_dp4a(xq32[j],     0x01010101, xis0);
             xis1 = ggml_cuda_dp4a(xq32[j + 4], 0x01010101, xis1);
         }
@@ -584,7 +604,7 @@ static __global__ void mul_mat_vec_q6k_repacked(
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
             int idot0 = 0, idot1 = 0;
 #pragma unroll
-            for (int j = 0; j < 4; j++) {
+            for (int j = hj0; j < hj1; j++) {
                 const uint32_t ge = 2 * j;
                 const uint32_t go = 2 * j + 1;
                 const uint32_t he = ((ge < 4 ? h2lo : h2hi) >> (8 * (ge & 3))) & 0xFFu;
