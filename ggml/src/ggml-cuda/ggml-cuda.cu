@@ -1664,6 +1664,39 @@ static const cublas_force_compute_type & ggml_cuda_cublas_get_force_compute_type
     return compute_type;
 }
 
+#if defined(GGML_USE_HIP)
+// Plain-FMA tiled F32 GEMM, launched on GCN (gfx906) where rocBLAS on
+// ROCm 7.1 ships no gfx906 Tensile and the MMA-based mmf path needs
+// matrix cores gfx906 lacks, so the cublasSgemm(OP_T, OP_N) fallback has
+// no backend. Same contract: C[m + n*ldc] = sum_k A[m*lda + k]*B[n*ldb + k].
+// Generic code (no GCN intrinsics): compiled for all HIP builds, run only
+// when the runtime device is GCN.
+#define GCN_F32_TILE 16
+static __global__ void gcn_f32_gemm_tn(
+        const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc) {
+    __shared__ float As[GCN_F32_TILE][GCN_F32_TILE];
+    __shared__ float Bs[GCN_F32_TILE][GCN_F32_TILE];
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int m = blockIdx.y * GCN_F32_TILE + ty;
+    const int n = blockIdx.x * GCN_F32_TILE + tx;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += GCN_F32_TILE) {
+        As[ty][tx] = (m < M && k0 + tx < K) ? A[(size_t) m * lda + (k0 + tx)] : 0.0f;
+        Bs[tx][ty] = (n < N && k0 + ty < K) ? B[(size_t) n * ldb + (k0 + ty)] : 0.0f;
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < GCN_F32_TILE; p++) {
+            acc += As[ty][p] * Bs[tx][p];
+        }
+        __syncthreads();
+    }
+    if (m < M && n < N) {
+        C[(size_t) m + (size_t) n * ldc] = acc;
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
 static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -1806,16 +1839,29 @@ static void ggml_cuda_op_mul_mat_cublas(
         const float * src0_ddf_i = src0->type == GGML_TYPE_F32 ? (const float *) src0_dd_i : src0_ddq_as_f32.get();
         const float * src1_ddf1_i = src1->type == GGML_TYPE_F32 ? (const float *) src1_ddf_i : src1_ddq_as_f32.get();
 
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
+#if defined(GGML_USE_HIP)
+        if (GGML_CUDA_CC_IS_GCN(cc)) {
+            const dim3 block(GCN_F32_TILE, GCN_F32_TILE);
+            const dim3 grid((src1_ncols + GCN_F32_TILE - 1) / GCN_F32_TILE,
+                            (row_diff   + GCN_F32_TILE - 1) / GCN_F32_TILE);
+            gcn_f32_gemm_tn<<<grid, block, 0, stream>>>(
+                src0_ddf_i, src1_ddf1_i, dst_dd_i,
+                (int) row_diff, (int) src1_ncols, (int) ne10,
+                (int) ne00, (int) ne10, (int) ldc);
+        } else
+#endif // defined(GGML_USE_HIP)
+        {
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
-        CUBLAS_CHECK(
-            cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
-                    row_diff, src1_ncols, ne10,
-                    &alpha, src0_ddf_i,  ne00,
-                            src1_ddf1_i, ne10,
-                    &beta,  dst_dd_i,    ldc));
+            CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+            CUBLAS_CHECK(
+                cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha, src0_ddf_i,  ne00,
+                                src1_ddf1_i, ne10,
+                        &beta,  dst_dd_i,    ldc));
+        }
     }
 
     GGML_UNUSED_VARS(dst, src1_ddq_i, src1_padded_row_size);
