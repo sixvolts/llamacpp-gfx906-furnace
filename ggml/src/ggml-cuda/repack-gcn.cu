@@ -25,6 +25,7 @@ static __host__ __device__ inline int64_t repack_q4k_nsp(const int64_t ne0) {
 }
 
 // Plane bytes per type:
+//   Q3_K: 8 lo2 + 4 hi1 + 2 signed-scale-pair per sub-block, 2 (d) per superblock
 //   Q4_K: 16 nib + 2 sc|m per sub-block, 4 (d|dmin fp16) per superblock
 //   Q5_K: 16 nib + 4 qh + 2 sc|m per sub-block, 4 per superblock
 //   Q6_K: 16 nib + 8 h2 + 2 signed-scale-pair per sub-block, 2 (d) per superblock
@@ -33,6 +34,7 @@ static inline size_t repack_gcn_nbytes(const ggml_type type, const int64_t ne0, 
     const int64_t nsp      = repack_q4k_nsp(ne0);
     const int64_t n_blocks = ne0 / 256;
     switch (type) {
+        case GGML_TYPE_Q3_K: return (size_t) ne1 * (nsp * 14 + n_blocks * 2);
         case GGML_TYPE_Q4_K: return (size_t) ne1 * (nsp * 18 + n_blocks * 4);
         case GGML_TYPE_Q5_K: return (size_t) ne1 * (nsp * 22 + n_blocks * 4);
         case GGML_TYPE_Q6_K: return (size_t) ne1 * (nsp * 26 + n_blocks * 2);
@@ -47,6 +49,7 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
         return false;
     }
     switch (t->type) {
+        case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K: return t->ne[0] % 256 == 0;
@@ -241,6 +244,75 @@ static void repack_q6k_host(const block_q6_K * blocks, uint8_t * dst, const int6
     }
 }
 
+// Q3_K: the 3-bit quant stays sub-nibble to fit VRAM. A lo2 plane (low 2
+// bits, packed like Q6_K's h2) and a hi1 plane (high bit, packed like
+// Q5_K's qh) reconstruct q3 = lo2 | (hbit << 2) at compute. Symmetric
+// like Q6_K (bias 4) with a signed per-16-weight scale pair (unpacked
+// 6-bit scale minus 32) and a d-only superblock plane.
+static void repack_q3k_host(const block_q3_K * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    const int64_t n_blocks = ne0 / 256;
+    const int64_t nsp      = repack_q4k_nsp(ne0);
+    const size_t  lo2_len  = (size_t) ne1 * nsp * 8;
+    const size_t  hi1_len  = (size_t) ne1 * nsp * 4;
+    const size_t  sm_len   = (size_t) ne1 * nsp * 2;
+
+    memset(dst, 0, lo2_len + hi1_len + sm_len + (size_t) ne1 * n_blocks * 2);
+
+    const uint32_t kmask1 = 0x03030303;
+    const uint32_t kmask2 = 0x0f0f0f0f;
+
+    for (int64_t row = 0; row < ne1; row++) {
+        for (int64_t blk = 0; blk < n_blocks; blk++) {
+            const block_q3_K * b = &blocks[row * n_blocks + blk];
+
+            memcpy(dst + lo2_len + hi1_len + sm_len + (size_t)(row * n_blocks + blk) * 2, &b->d, 2);
+
+            // ggml-quants.c dequantize_row_q3_K: unpack the 16 6-bit scales
+            uint32_t aux[4];
+            memcpy(aux, b->scales, 12);
+            const uint32_t tmp = aux[2];
+            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+            aux[0] = ( aux[0]       & kmask2) | (((tmp >> 0) & kmask1) << 4);
+            aux[1] = ( aux[1]       & kmask2) | (((tmp >> 2) & kmask1) << 4);
+            const uint8_t * sc6 = (const uint8_t *) aux;
+
+            for (int s = 0; s < 8; s++) {
+                const int64_t gsb   = blk * 8 + s;
+                const int     n     = s >> 2;
+                const int     shift = 2 * (s & 3);
+                const uint8_t * qs  = b->qs + n * 32;
+
+                uint8_t  lo2[32], hb[32];
+                for (int k = 0; k < 32; k++) {
+                    lo2[k] = (qs[k] >> shift) & 3;
+                    hb[k]  = (b->hmask[k] >> s) & 1;
+                }
+
+                // lo2 plane: byte 2j holds the low-half group j (weights
+                // 4j..), byte 2j+1 the high-half (weights 16+4j..), weight
+                // b at bits 2b..2b+1 -- the Q6_K h2 packing.
+                uint8_t lo2p[8] = {};
+                uint32_t hi1p = 0;
+                for (int j = 0; j < 4; j++) {
+                    for (int bb = 0; bb < 4; bb++) {
+                        lo2p[2 * j]     |= lo2[4 * j + bb]      << (2 * bb);
+                        lo2p[2 * j + 1] |= lo2[16 + 4 * j + bb] << (2 * bb);
+                        hi1p |= (uint32_t) hb[4 * j + bb]      << (8 * j + bb);
+                        hi1p |= (uint32_t) hb[16 + 4 * j + bb] << (8 * j + 4 + bb);
+                    }
+                }
+                memcpy(dst + (size_t)(row * nsp + gsb) * 8, lo2p, 8);
+                memcpy(dst + lo2_len + (size_t)(row * nsp + gsb) * 4, &hi1p, 4);
+
+                uint8_t * sm = dst + lo2_len + hi1_len + (size_t)(row * nsp + gsb) * 2;
+                sm[0] = (uint8_t) (int8_t) ((int) sc6[2 * s]     - 32);
+                sm[1] = (uint8_t) (int8_t) ((int) sc6[2 * s + 1] - 32);
+            }
+        }
+    }
+}
+
 // Q8_0: two planes — 32 aligned qs bytes per sub-block, then the fp16
 // d-scales as their own stream. Same bytes as on-disk modulo padding;
 // the win is alignment (one i32 load per sdot4 instead of two
@@ -422,6 +494,16 @@ static __device__ __forceinline__ uint32_t repack_spread4(const uint32_t h) {
 static __device__ __forceinline__ uint32_t repack_spread2(const uint32_t h) {
     return ((h & 0x03u) << 4) | ((h & 0x0Cu) << 10)
          | ((h & 0x30u) << 16) | ((h & 0xC0u) << 22);
+}
+
+// Q3_K reconstruction: four 2-bit fields to bits 0..1 of bytes 0..3 (the
+// low pair) and four 1-bit fields to bit 2 of bytes 0..3 (the high bit).
+static __device__ __forceinline__ uint32_t repack_spread2_lo(const uint32_t h) {
+    return (h & 0x03u) | ((h & 0x0Cu) << 6)
+         | ((h & 0x30u) << 12) | ((h & 0xC0u) << 18);
+}
+static __device__ __forceinline__ uint32_t repack_spread1_hi(const uint32_t h) {
+    return ((h & 1u) << 2) | ((h & 2u) << 9) | ((h & 4u) << 16) | ((h & 8u) << 23);
 }
 
 // Q5_K repacked matvec — Q4_K's shape plus the qh plane OR-ed onto the
@@ -613,6 +695,108 @@ static __global__ void mul_mat_vec_q6k_repacked(
             }
             acc[r] += dsc_lo * dx * (float)(idot0 - 32 * xis0)
                     + dsc_hi * dx * (float)(idot1 - 32 * xis1);
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const float a = warp_reduce_sum<64>(acc[r]);
+        if (lane == 0 && (row0 + r) < (int) ne1) {
+            y[row0 + r] = a;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, ids_src1, ids_dst, expert_bounds, n_expert, expert_stride, xs_id, dst_s1);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+// Q3_K repacked matvec. Like Q6_K but the quant is 2-bit lo + 1-bit hi
+// (no 4-bit nibble plane); reconstruct q3 = lo2 | (hbit << 2) per group.
+// Symmetric with bias 4.
+template <bool HAS_IDS>
+static __global__ void mul_mat_vec_q3k_repacked(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, const uint32_t n_expert,
+        const size_t expert_stride, const uint32_t xs_id, const uint32_t dst_s1) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    if constexpr (HAS_IDS) {
+        const uint32_t a = blockIdx.y;
+        const uint32_t e = (uint32_t) ids_src1[a];
+        wbase += e * expert_stride;
+        xq    += (size_t) a * xs_id;
+        y     += (size_t) a * dst_s1;
+        GGML_UNUSED_VARS(ids_dst, expert_bounds, n_expert);
+    } else {
+        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, n_expert, expert_stride, xs_id, dst_s1);
+    }
+    constexpr int ROWS = 2;
+    const int wave = threadIdx.x >> 6;
+    const int lane = threadIdx.x & 63;
+    const int row0 = blockIdx.x * (ROWS * 4) + wave * ROWS;
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    const uint32_t n_super = n_sub >> 3;
+
+    const uint2    * lo2p = reinterpret_cast<const uint2 *>(wbase);
+    const uint32_t * hi1p = reinterpret_cast<const uint32_t *>(
+        wbase + (size_t) ne1 * nsp * 8);
+    const uint16_t * smp = reinterpret_cast<const uint16_t *>(
+        wbase + (size_t) ne1 * nsp * 8 + (size_t) ne1 * nsp * 4);
+    const uint16_t * ddp = reinterpret_cast<const uint16_t *>(
+        wbase + (size_t) ne1 * nsp * 8 + (size_t) ne1 * nsp * 4 + (size_t) ne1 * nsp * 2);
+
+    float acc[ROWS] = {0.0f, 0.0f};
+
+    const uint32_t n_unit = HAS_IDS ? n_sub * 2 : n_sub; // see Q4_K note
+    for (uint32_t u = lane; u < n_unit; u += 64) {
+        const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
+        const uint32_t half = HAS_IDS ? (u & 1)  : 0;
+        const int hj0 = HAS_IDS ? (int)(half * 2) : 0;
+        const int hj1 = HAS_IDS ? hj0 + 2         : 4;
+        const block_q8_1 * xb = xq + sb;
+        const float dx = __low2float(xb->ds);
+        const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+
+        int xis0 = 0, xis1 = 0;
+#pragma unroll
+        for (int j = hj0; j < hj1; j++) {
+            xis0 = ggml_cuda_dp4a(xq32[j],     0x01010101, xis0);
+            xis1 = ggml_cuda_dp4a(xq32[j + 4], 0x01010101, xis1);
+        }
+
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const int row = row0 + r;
+            if (row >= (int) ne1) {
+                continue;
+            }
+            const size_t   idx    = (size_t) row * nsp + sb;
+            const uint2    lo2v   = lo2p[idx];
+            const uint32_t qh     = hi1p[idx];
+            const uint16_t sm     = smp[idx];
+            const uint16_t d_bits = ddp[(size_t) row * n_super + (sb >> 3)];
+            const float d = __half2float(*reinterpret_cast<const __half *>(&d_bits));
+            const float dsc_lo = d * (float)(int)(int8_t)(sm & 0xFFu);
+            const float dsc_hi = d * (float)(int)(int8_t)(sm >> 8);
+
+            const uint32_t lo2lo = lo2v.x, lo2hi = lo2v.y;
+            int idot0 = 0, idot1 = 0;
+#pragma unroll
+            for (int j = hj0; j < hj1; j++) {
+                const uint32_t ge = 2 * j;
+                const uint32_t go = 2 * j + 1;
+                const uint32_t lb = ((ge < 4 ? lo2lo : lo2hi) >> (8 * (ge & 3))) & 0xFFu;
+                const uint32_t hb = ((go < 4 ? lo2lo : lo2hi) >> (8 * (go & 3))) & 0xFFu;
+                const uint32_t q3lo = repack_spread2_lo(lb) | repack_spread1_hi((qh >> (8 * j))     & 0xFu);
+                const uint32_t q3hi = repack_spread2_lo(hb) | repack_spread1_hi((qh >> (8 * j + 4)) & 0xFu);
+                idot0 = ggml_cuda_dp4a((int) q3lo, xq32[j],     idot0);
+                idot1 = ggml_cuda_dp4a((int) q3hi, xq32[j + 4], idot1);
+            }
+            acc[r] += dsc_lo * dx * (float)(idot0 - 4 * xis0)
+                    + dsc_hi * dx * (float)(idot1 - 4 * xis1);
         }
     }
 
@@ -1288,6 +1472,161 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q6k_repacked(
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
+// Q3_K MMQ — Q6_K's tiles but the quant is 2-bit lo + 1-bit hi (no 4-bit
+// nibble plane); reconstruct q3 = lo2 | (hbit << 2). Symmetric, bias 4.
+template <bool HAS_IDS, int TN_>
+static __global__ void __launch_bounds__(256, 2) mmq_gemm_q3k_repacked(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const uint32_t n_tok, const uint32_t x_stride,
+        const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
+        const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const int t  = threadIdx.x;
+    const int tx = t & 15;
+    const int ty = t >> 4;
+    const uint32_t row0 = blockIdx.x * MMQ_RP_BM;
+    uint32_t tok0 = blockIdx.y * (16 * TN_);
+    uint32_t a_base = 0, a_end = 0;
+    if constexpr (HAS_IDS) {
+        if (blockIdx.y >= (uint32_t) tile_off[n_expert]) {
+            return;
+        }
+        const uint32_t e = repack_find_expert(tile_off, n_expert, blockIdx.y);
+        const uint32_t local_tile = blockIdx.y - (uint32_t) tile_off[e];
+        a_base = (uint32_t) expert_bounds[e] + local_tile * (16 * TN_);
+        a_end  = (uint32_t) expert_bounds[e + 1];
+        wbase += e * expert_stride;
+        tok0   = 0;
+    } else {
+        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, tile_off, n_expert, expert_stride);
+    }
+
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    const uint32_t n_super = n_sub >> 3;
+    const uint2    * lo2p = reinterpret_cast<const uint2 *>(wbase);
+    const uint32_t * hi1p = reinterpret_cast<const uint32_t *>(
+        wbase + (size_t) ne1 * nsp * 8);
+    const uint16_t * smp = reinterpret_cast<const uint16_t *>(
+        wbase + (size_t) ne1 * nsp * 8 + (size_t) ne1 * nsp * 4);
+    const uint16_t * ddp = reinterpret_cast<const uint16_t *>(
+        wbase + (size_t) ne1 * nsp * 8 + (size_t) ne1 * nsp * 4 + (size_t) ne1 * nsp * 2);
+
+    __shared__ uint2      sWl[MMQ_RP_BM][MMQ_RP_BK];
+    __shared__ uint32_t   sWh[MMQ_RP_BM][MMQ_RP_BK];
+    __shared__ float2     sWs[MMQ_RP_BM][MMQ_RP_BK];
+    __shared__ block_q8_1 sX [(16 * TN_)][MMQ_RP_BK + 1];
+
+    float acc[MMQ_RP_TM][TN_] = {};
+
+    const int lr = t >> 2;
+    const int lk = t & 3;
+
+    for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_BK) {
+        const uint32_t sb   = sb0 + lk;
+        const uint32_t wrow = row0 + lr;
+        if (wrow < ne1 && sb < n_sub) {
+            sWl[lr][lk] = lo2p[(size_t) wrow * nsp + sb];
+            sWh[lr][lk] = hi1p[(size_t) wrow * nsp + sb];
+            const uint16_t sm     = smp[(size_t) wrow * nsp + sb];
+            const uint16_t d_bits = ddp[(size_t) wrow * n_super + (sb >> 3)];
+            const float d = __half2float(*reinterpret_cast<const __half *>(&d_bits));
+            sWs[lr][lk] = make_float2(d * (float)(int)(int8_t)(sm & 0xFFu),
+                                      d * (float)(int)(int8_t)(sm >> 8));
+        } else {
+            sWs[lr][lk] = make_float2(0.0f, 0.0f);
+        }
+        if (lr < (16 * TN_)) {
+            uint32_t xcol = tok0 + lr;
+            bool     xval = xcol < n_tok;
+            if constexpr (HAS_IDS) {
+                const uint32_t a = a_base + lr;
+                xval = a < a_end;
+                xcol = xval ? (uint32_t) ids_src1[a] : 0;
+            }
+            if (xval && sb < n_sub) {
+                sX[lr][lk] = xq[(size_t) xcol * x_stride + sb];
+            } else {
+                sX[lr][lk].ds = make_half2(0.0f, 0.0f);
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int kk = 0; kk < MMQ_RP_BK; kk++) {
+            uint2 wl[MMQ_RP_TM]; uint32_t wh[MMQ_RP_TM];
+            float dlo[MMQ_RP_TM], dhi[MMQ_RP_TM];
+#pragma unroll
+            for (int r = 0; r < MMQ_RP_TM; r++) {
+                wl[r] = sWl[ty + r * 16][kk];
+                wh[r] = sWh[ty + r * 16][kk];
+                const float2 s = sWs[ty + r * 16][kk];
+                dlo[r] = s.x;
+                dhi[r] = s.y;
+            }
+#pragma unroll
+            for (int n = 0; n < TN_; n++) {
+                const block_q8_1 * xb = &sX[tx + n * 16][kk];
+                const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+                const float dx = __low2float(xb->ds);
+                int xis0 = 0, xis1 = 0;
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    xis0 = ggml_cuda_dp4a(xq32[j],     0x01010101, xis0);
+                    xis1 = ggml_cuda_dp4a(xq32[j + 4], 0x01010101, xis1);
+                }
+#pragma unroll
+                for (int r = 0; r < MMQ_RP_TM; r++) {
+                    const uint32_t lo2lo = wl[r].x, lo2hi = wl[r].y, qh = wh[r];
+                    int idot0 = 0, idot1 = 0;
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        const uint32_t ge = 2 * j;
+                        const uint32_t go = 2 * j + 1;
+                        const uint32_t lb = ((ge < 4 ? lo2lo : lo2hi) >> (8 * (ge & 3))) & 0xFFu;
+                        const uint32_t hb = ((go < 4 ? lo2lo : lo2hi) >> (8 * (go & 3))) & 0xFFu;
+                        const uint32_t q3lo = repack_spread2_lo(lb) | repack_spread1_hi((qh >> (8 * j))     & 0xFu);
+                        const uint32_t q3hi = repack_spread2_lo(hb) | repack_spread1_hi((qh >> (8 * j + 4)) & 0xFu);
+                        idot0 = ggml_cuda_dp4a((int) q3lo, xq32[j],     idot0);
+                        idot1 = ggml_cuda_dp4a((int) q3hi, xq32[j + 4], idot1);
+                    }
+                    acc[r][n] += dlo[r] * dx * (float)(idot0 - 4 * xis0)
+                               + dhi[r] * dx * (float)(idot1 - 4 * xis1);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < MMQ_RP_TM; r++) {
+        const uint32_t row = row0 + ty + r * 16;
+        if (row >= ne1) {
+            continue;
+        }
+#pragma unroll
+        for (int n = 0; n < TN_; n++) {
+            if constexpr (HAS_IDS) {
+                const uint32_t a = a_base + tx + n * 16;
+                if (a < a_end) {
+                    y[(size_t) ids_dst[a] * dst_s1 + row] = acc[r][n];
+                }
+            } else {
+                const uint32_t tok = tok0 + tx + n * 16;
+                if (tok < n_tok) {
+                    y[(size_t) tok * dst_s1 + row] = acc[r][n];
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride, ids_src1, ids_dst, expert_bounds, tile_off, n_expert, expert_stride, dst_s1);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
 // Q8_0 MMQ — 32 qs bytes per sub-block staged as two uint4s; no offset
 // term, so the accumulate is just dsc * dx * idot.
 template <bool HAS_IDS, int TN_>
@@ -1480,6 +1819,12 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
     if (ne11 == 1) {
         // decode: dp4a matvec straight from the planes
         switch (src0->type) {
+            case GGML_TYPE_Q3_K: {
+                const dim3 grid((ne01 + 7) / 8, 1, 1);
+                mul_mat_vec_q3k_repacked<false><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    nullptr, nullptr, nullptr, 0, 0, 0, 0);
+            } break;
             case GGML_TYPE_Q4_K: {
                 const dim3 grid((ne01 + 7) / 8, 1, 1);
                 mul_mat_vec_q4k_repacked<false><<<grid, 256, 0, stream>>>(
@@ -1530,6 +1875,11 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
     const dim3 grid((ne01 + MMQ_RP_BM - 1) / MMQ_RP_BM,
                     (ne11 + MMQ_RP_BN - 1) / MMQ_RP_BN, 1);
     switch (src0->type) {
+        case GGML_TYPE_Q3_K:
+            mmq_gemm_q3k_repacked<false, MMQ_RP_TN><<<grid, 256, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
+                nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+            break;
         case GGML_TYPE_Q4_K:
             mmq_gemm_q4k_repacked<false, MMQ_RP_TN><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
@@ -1622,6 +1972,13 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         // shared activation column for all slots) uses x-stride 0.
         const uint32_t xs_eff = src1->ne[1] == 1 ? 0u : (uint32_t) x_stride;
         switch (src0->type) {
+            case GGML_TYPE_Q3_K: {
+                const dim3 grid((ne01 + 7) / 8, n_assign, 1);
+                mul_mat_vec_q3k_repacked<true><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    (const int32_t *) ids->data, nullptr, nullptr,
+                    (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
+            } break;
             case GGML_TYPE_Q4_K: {
                 const dim3 grid((ne01 + 7) / 8, n_assign, 1);
                 mul_mat_vec_q4k_repacked<true><<<grid, 256, 0, stream>>>(
@@ -1673,6 +2030,12 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const dim3 grid((ne01 + MMQ_RP_BM - 1) / MMQ_RP_BM, max_tiles, 1);
 
     switch (src0->type) {
+        case GGML_TYPE_Q3_K:
+            mmq_gemm_q3k_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
+                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(),
+                (uint32_t) ne02, expert_stride, dst_s1);
+            break;
         case GGML_TYPE_Q4_K:
             mmq_gemm_q4k_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
@@ -1821,6 +2184,7 @@ static void ggml_backend_cuda_repack_buffer_set_tensor(
         const uint8_t * src_e = (const uint8_t *) data + e * src_stride;
         uint8_t       * dst_e = staged.data() + e * dst_stride;
         switch (tensor->type) {
+            case GGML_TYPE_Q3_K: repack_q3k_host ((const block_q3_K *) src_e, dst_e, ne0, ne1); break;
             case GGML_TYPE_Q4_K: repack_q4k_host ((const block_q4_K *) src_e, dst_e, ne0, ne1); break;
             case GGML_TYPE_Q5_K: repack_q5k_host ((const block_q5_K *) src_e, dst_e, ne0, ne1); break;
             case GGML_TYPE_Q6_K: repack_q6k_host ((const block_q6_K *) src_e, dst_e, ne0, ne1); break;
