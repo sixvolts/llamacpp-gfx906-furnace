@@ -140,7 +140,7 @@ static constexpr __device__ int get_mmq_x_max_device() {
 }
 
 static int get_mmq_y_host(const int cc) {
-    return GGML_CUDA_CC_IS_AMD(cc) ? (GGML_CUDA_CC_IS_RDNA1(cc) ? 64 : 128) :
+    return GGML_CUDA_CC_IS_AMD(cc) ? (GGML_CUDA_CC_IS_RDNA1(cc) ? 64 : 64) : // gfx906: 128->64 (occupancy)
         ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ? 128 : 64);
 }
 
@@ -158,7 +158,7 @@ static constexpr __device__ int get_mmq_y_device() {
 #if defined(RDNA1)
     return 64;
 #else
-    return 128;
+    return 64; // gfx906: 128->64 (occupancy)
 #endif // defined RDNA1
 #else
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
