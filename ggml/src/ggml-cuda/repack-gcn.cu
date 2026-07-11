@@ -795,6 +795,87 @@ static __global__ void mul_mat_vec_q6k_repacked_ncols(
 #endif
 }
 
+// Q5_K repacked matvec, batched over NCOLS columns (dense, register-lean).
+// Same structure as the Q6_K ncols kernel: ROWS=1, unpack each weight tile
+// once per sub-block and dot it against every column inline (only acc[NCOLS]
+// and the unpacked nibble/high-bit stay live). Q5_K is asymmetric — 4-bit
+// nibble + 1 high bit (repack_spread4), scale dsc and min deff per sub-block,
+// with the min folded via the activation sum sx: acc += dsc*dx*idot - deff*sx.
+template <int NCOLS>
+static __global__ void mul_mat_vec_q5k_repacked_ncols(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const uint32_t x_col_stride, const uint32_t y_col_stride) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const int wave = threadIdx.x >> 6;
+    const int lane = threadIdx.x & 63;
+    const int row  = blockIdx.x * 4 + wave;
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    const uint32_t n_super = n_sub >> 3;
+
+    const uint4    * nib = reinterpret_cast<const uint4 *>(wbase);
+    const uint32_t * qhp = reinterpret_cast<const uint32_t *>(
+        wbase + (size_t) ne1 * nsp * 16);
+    const uint16_t * smp = reinterpret_cast<const uint16_t *>(
+        wbase + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 4);
+    const uint32_t * ddp = reinterpret_cast<const uint32_t *>(
+        wbase + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 4 + (size_t) ne1 * nsp * 2);
+
+    float acc[NCOLS];
+#pragma unroll
+    for (int c = 0; c < NCOLS; c++) acc[c] = 0.0f;
+
+    if (row < (int) ne1) {
+        for (uint32_t sb = lane; sb < n_sub; sb += 64) {
+            const size_t   idx = (size_t) row * nsp + sb;
+            const uint4    q   = nib[idx];
+            const uint32_t qh  = qhp[idx];
+            const uint16_t sm  = smp[idx];
+            const uint32_t dd  = ddp[(size_t) row * n_super + (sb >> 3)];
+            const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
+            const uint16_t dmin_bits = (uint16_t)(dd >> 16);
+            const float dsc  = __half2float(*reinterpret_cast<const __half *>(&d_bits))
+                               * (float)(sm & 0xFFu);
+            const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits))
+                               * (float)(sm >> 8);
+            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+            uint32_t lo[4], hi[4];
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                lo[j] = ( qa[j]       & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j))     & 0xFu);
+                hi[j] = ((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j + 4)) & 0xFu);
+            }
+#pragma unroll
+            for (int c = 0; c < NCOLS; c++) {
+                const block_q8_1 * xb = xq + (size_t) c * x_col_stride + sb;
+                const float dx = __low2float(xb->ds);
+                const float sx = __high2float(xb->ds);
+                const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+                int idot = 0;
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    idot = ggml_cuda_dp4a((int) lo[j], xq32[j],     idot);
+                    idot = ggml_cuda_dp4a((int) hi[j], xq32[j + 4], idot);
+                }
+                acc[c] += dsc * dx * (float) idot - deff * sx;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int c = 0; c < NCOLS; c++) {
+        const float a = warp_reduce_sum<64>(acc[c]);
+        if (lane == 0 && row < (int) ne1) {
+            y[(size_t) c * y_col_stride + row] = a;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, x_col_stride, y_col_stride);
+    NO_DEVICE_CODE;
+#endif
+}
+
 // Q3_K repacked matvec. Like Q6_K but the quant is 2-bit lo + 1-bit hi
 // (no 4-bit nibble plane); reconstruct q3 = lo2 | (hbit << 2) per group.
 // Symmetric with bias 4.
@@ -1916,6 +1997,24 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                 case 6: mul_mat_vec_q6k_repacked_ncols<6><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
                 case 7: mul_mat_vec_q6k_repacked_ncols<7><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
                 case 8: mul_mat_vec_q6k_repacked_ncols<8><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
+            }
+            return;
+        }
+        // LEVER 3: same batched-matvec treatment for dense Q5_K (this model's
+        // fused attn_qkv on the GDN layers is the one non-Q6_K dense matmul;
+        // ~12% of decode was reloading its weights per column via the loop).
+        if (ne11 >= 2 && src0->type == GGML_TYPE_Q5_K) {
+            const dim3 grid((ne01 + 3) / 4, 1, 1);
+            const uint32_t xcs = (uint32_t) x_stride;
+            const uint32_t ycs = (uint32_t) ne01;
+            switch (ne11) {
+                case 2: mul_mat_vec_q5k_repacked_ncols<2><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
+                case 3: mul_mat_vec_q5k_repacked_ncols<3><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
+                case 4: mul_mat_vec_q5k_repacked_ncols<4><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
+                case 5: mul_mat_vec_q5k_repacked_ncols<5><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
+                case 6: mul_mat_vec_q5k_repacked_ncols<6><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
+                case 7: mul_mat_vec_q5k_repacked_ncols<7><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
+                case 8: mul_mat_vec_q5k_repacked_ncols<8><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
             }
             return;
         }
