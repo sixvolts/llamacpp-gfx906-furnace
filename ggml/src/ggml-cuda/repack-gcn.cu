@@ -1966,6 +1966,24 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
             src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
+    // LEVER 4: per-sequence decode fold. The GDN output projection (ssm_out)
+    // arrives as ne11==1 with ne12=n_seqs — the delta-net emits [d,1,n_seqs],
+    // so the loop below would issue n_seqs separate ne11=1 matvecs, each
+    // re-reading the full weight. The seq slices are contiguous (quantized
+    // blocks pack densely at x_stride; dst columns at ne01 when contiguous),
+    // so fold ne12 into the column batch: one ne11=ne12 call reuses the
+    // batched ncols kernel (same weight read feeds all seqs). Same weights for
+    // every slice (2D src0 broadcast), so this is exact.
+    static const int repack_nofold = getenv("REPACK_NOFOLD") ? atoi(getenv("REPACK_NOFOLD")) : 0;
+    if (!repack_nofold &&
+        ne13 == 1 && ne11 == 1 && ne12 >= 2 && ne12 <= 8 &&
+        dst->nb[2] == (size_t) ne01 * sizeof(float)) {
+        ggml_cuda_mul_mat_repacked_slice(ctx, src0, w,
+            (const block_q8_1 *) src1_q8_1.get(), (float *) dst->data,
+            ne00, ne01, /*ne11=*/ne12, x_stride, stream);
+        return;
+    }
+
     for (int64_t i3 = 0; i3 < ne13; i3++) {
     for (int64_t i2 = 0; i2 < ne12; i2++) {
         const block_q8_1 * xq = (const block_q8_1 *) src1_q8_1.get()
@@ -1981,6 +1999,13 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, const int64_t ne00, const int64_t ne01, const int64_t ne11,
         const int64_t x_stride, cudaStream_t stream) {
+    // REPACK_TRACE=1: log dense repacked matmul shapes in the decode range so
+    // we can see which tensors run at ne11=1 vs batched. No-op unless env set.
+    static const int repack_trace = getenv("REPACK_TRACE") ? atoi(getenv("REPACK_TRACE")) : 0;
+    if (repack_trace && ne11 <= 8) {
+        fprintf(stderr, "[repack-trace] MM   name=%-28s type=%-6s ne00=%5ld ne01=%6ld ne11=%ld\n",
+            src0->name, ggml_type_name(src0->type), (long) ne00, (long) ne01, (long) ne11);
+    }
     if (ne11 <= 8) {
         // LEVER 1b: batched matvec for the dominant Q6_K dense case. One
         // weight-tile load feeds all ne11 columns (amortizes weight bandwidth);
@@ -2128,6 +2153,12 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     GGML_ASSERT(ne10 == ne00);
     const int64_t n_expert_used = ids->ne[0];
     const int64_t n_tokens      = ids->ne[1];
+
+    static const int repack_trace = getenv("REPACK_TRACE") ? atoi(getenv("REPACK_TRACE")) : 0;
+    if (repack_trace && n_tokens <= 8) {
+        fprintf(stderr, "[repack-trace] MMID name=%-28s type=%-6s ne00=%5ld ne01=%6ld n_tokens=%ld\n",
+            src0->name, ggml_type_name(src0->type), (long) ne00, (long) ne01, (long) n_tokens);
+    }
     const int64_t n_assign      = n_expert_used * n_tokens;
 
     cudaStream_t stream = ctx.stream();
