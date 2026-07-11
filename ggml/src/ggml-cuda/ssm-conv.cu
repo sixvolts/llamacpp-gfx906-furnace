@@ -90,7 +90,15 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
 #pragma unroll
     for (int idx = 0; idx < total_elems; idx += split_d_inner) {
         if (row < (int)split_d_inner) {
-            smem[row * n_cols + col] = x_block[row * stride_x + col];
+            // Bound the staged column to this z-block's valid extent. The last
+            // z-block has local_n_t < split_n_t when n_t % split_n_t != 0, but
+            // load_cols is fixed at d_conv-1+split_n_t; without this guard the
+            // read walks (split_n_t - local_n_t) columns past conv_input's end
+            // (illegal access at the last row of the last sequence). The compute
+            // loop only consumes columns < d_conv-1+local_n_t, so the zeroed
+            // tail is never used.
+            const int valid_cols = d_conv - 1 + (int) local_n_t;
+            smem[row * n_cols + col] = col < valid_cols ? x_block[row * stride_x + col] : 0.0f;
         }
 
         col += split_d_inner;
