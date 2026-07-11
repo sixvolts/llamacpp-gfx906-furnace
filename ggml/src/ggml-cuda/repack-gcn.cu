@@ -711,6 +711,90 @@ static __global__ void mul_mat_vec_q6k_repacked(
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
+// Q6_K repacked matvec, batched over NCOLS columns (dense, register-lean).
+// ROWS=1 (one output row per wave) + no cached per-column arrays: unpack each
+// weight tile once per sub-block and dot it against every column inline, so
+// only acc[NCOLS] and the 8-reg weight unpack stay live. Low VGPR pressure
+// keeps occupancy up on gfx906 while still amortizing the weight bandwidth.
+template <int NCOLS>
+static __global__ void mul_mat_vec_q6k_repacked_ncols(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const uint32_t x_col_stride, const uint32_t y_col_stride) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const int wave = threadIdx.x >> 6;
+    const int lane = threadIdx.x & 63;
+    const int row  = blockIdx.x * 4 + wave;
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    const uint32_t n_super = n_sub >> 3;
+
+    const uint4    * nib = reinterpret_cast<const uint4 *>(wbase);
+    const uint32_t * h2p = reinterpret_cast<const uint32_t *>(
+        wbase + (size_t) ne1 * nsp * 16);
+    const uint16_t * smp = reinterpret_cast<const uint16_t *>(
+        wbase + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 8);
+    const uint16_t * ddp = reinterpret_cast<const uint16_t *>(
+        wbase + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 8 + (size_t) ne1 * nsp * 2);
+
+    float acc[NCOLS];
+#pragma unroll
+    for (int c = 0; c < NCOLS; c++) acc[c] = 0.0f;
+
+    if (row < (int) ne1) {
+        for (uint32_t sb = lane; sb < n_sub; sb += 64) {
+            const size_t   idx  = (size_t) row * nsp + sb;
+            const uint4    q    = nib[idx];
+            const uint32_t h2lo = h2p[idx * 2];
+            const uint32_t h2hi = h2p[idx * 2 + 1];
+            const uint16_t sm     = smp[idx];
+            const uint16_t d_bits = ddp[(size_t) row * n_super + (sb >> 3)];
+            const float d = __half2float(*reinterpret_cast<const __half *>(&d_bits));
+            const float dsc_lo = d * (float)(int)(int8_t)(sm & 0xFFu);
+            const float dsc_hi = d * (float)(int)(int8_t)(sm >> 8);
+            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+            uint32_t q6lo[4], q6hi[4];
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const uint32_t ge = 2 * j;
+                const uint32_t go = 2 * j + 1;
+                const uint32_t he = ((ge < 4 ? h2lo : h2hi) >> (8 * (ge & 3))) & 0xFFu;
+                const uint32_t ho = ((go < 4 ? h2lo : h2hi) >> (8 * (go & 3))) & 0xFFu;
+                q6lo[j] = ( qa[j]       & 0x0F0F0F0Fu) | repack_spread2(he);
+                q6hi[j] = ((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho);
+            }
+#pragma unroll
+            for (int c = 0; c < NCOLS; c++) {
+                const block_q8_1 * xb = xq + (size_t) c * x_col_stride + sb;
+                const float dx = __low2float(xb->ds);
+                const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+                int xis0 = 0, xis1 = 0, idot0 = 0, idot1 = 0;
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    xis0  = ggml_cuda_dp4a(xq32[j],       0x01010101, xis0);
+                    xis1  = ggml_cuda_dp4a(xq32[j + 4],   0x01010101, xis1);
+                    idot0 = ggml_cuda_dp4a((int) q6lo[j], xq32[j],     idot0);
+                    idot1 = ggml_cuda_dp4a((int) q6hi[j], xq32[j + 4], idot1);
+                }
+                acc[c] += dsc_lo * dx * (float)(idot0 - 32 * xis0)
+                        + dsc_hi * dx * (float)(idot1 - 32 * xis1);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int c = 0; c < NCOLS; c++) {
+        const float a = warp_reduce_sum<64>(acc[c]);
+        if (lane == 0 && row < (int) ne1) {
+            y[(size_t) c * y_col_stride + row] = a;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, x_col_stride, y_col_stride);
+    NO_DEVICE_CODE;
+#endif
+}
+
 // Q3_K repacked matvec. Like Q6_K but the quant is 2-bit lo + 1-bit hi
 // (no 4-bit nibble plane); reconstruct q3 = lo2 | (hbit << 2) per group.
 // Symmetric with bias 4.
@@ -1816,57 +1900,72 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, const int64_t ne00, const int64_t ne01, const int64_t ne11,
         const int64_t x_stride, cudaStream_t stream) {
-    if (ne11 == 1) {
-        // decode: dp4a matvec straight from the planes
-        switch (src0->type) {
-            case GGML_TYPE_Q3_K: {
-                const dim3 grid((ne01 + 7) / 8, 1, 1);
-                mul_mat_vec_q3k_repacked<false><<<grid, 256, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    nullptr, nullptr, nullptr, 0, 0, 0, 0);
-            } break;
-            case GGML_TYPE_Q4_K: {
-                const dim3 grid((ne01 + 7) / 8, 1, 1);
-                mul_mat_vec_q4k_repacked<false><<<grid, 256, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    nullptr, nullptr, nullptr, 0, 0, 0, 0);
-            } break;
-            case GGML_TYPE_Q5_K: {
-                const dim3 grid((ne01 + 7) / 8, 1, 1);
-                mul_mat_vec_q5k_repacked<false><<<grid, 256, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    nullptr, nullptr, nullptr, 0, 0, 0, 0);
-            } break;
-            case GGML_TYPE_Q6_K: {
-                const dim3 grid((ne01 + 7) / 8, 1, 1);
-                mul_mat_vec_q6k_repacked<false><<<grid, 256, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    nullptr, nullptr, nullptr, 0, 0, 0, 0);
-            } break;
-            case GGML_TYPE_Q8_0: {
-                // large ne01: single-wave ROWS=1 blocks maximize the
-                // wavefront count (measured on gfx906: ROWS=2 at
-                // ne01=4096 stalls ~184 GB/s, ROWS=1 ~2x it). Small
-                // ne01: 4-wave ROWS=2 blocks (the K-quant matvec shape).
-                if (ne01 >= 4096) {
-                    const dim3 grid(ne01, 1, 1);
-                    mul_mat_vec_q8_0_repacked<1, 1, false><<<grid, 64, 0, stream>>>(
-                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                        nullptr, nullptr, nullptr, 0, 0, 0, 0);
-                } else {
-                    // 4-wave ROWS=2 with half-sub-block work units is the
-                    // best of the swept variants (gfx906, 0.8B-Q8_0 tg128:
-                    // 231.0 vs 222.7 single-wave, 222.2 full-block units,
-                    // 219.9 ROWS=4, 214.2 quarter units; canonical mmvq
-                    // is 238.0 — the residual ~3% is why Q8_0 stays
-                    // behind its own env gate)
+    if (ne11 <= 8) {
+        // LEVER 1b: batched matvec for the dominant Q6_K dense case. One
+        // weight-tile load feeds all ne11 columns (amortizes weight bandwidth);
+        // other types fall through to the per-column loop below.
+        if (ne11 >= 2 && src0->type == GGML_TYPE_Q6_K) {
+            const dim3 grid((ne01 + 3) / 4, 1, 1);
+            const uint32_t xcs = (uint32_t) x_stride;
+            const uint32_t ycs = (uint32_t) ne01;
+            switch (ne11) {
+                case 2: mul_mat_vec_q6k_repacked_ncols<2><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
+                case 3: mul_mat_vec_q6k_repacked_ncols<3><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
+                case 4: mul_mat_vec_q6k_repacked_ncols<4><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
+                case 5: mul_mat_vec_q6k_repacked_ncols<5><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
+                case 6: mul_mat_vec_q6k_repacked_ncols<6><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
+                case 7: mul_mat_vec_q6k_repacked_ncols<7><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
+                case 8: mul_mat_vec_q6k_repacked_ncols<8><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xcs, ycs); break;
+            }
+            return;
+        }
+        // LEVER 1: small-batch decode loops the tuned single-column dp4a
+        // matvec per column instead of dropping to the prefill GEMM (which
+        // is ~4x slower at ne11=2..8 on gfx906). Each column keeps the fast
+        // repacked matvec; weights reload per column but still beat the GEMM.
+        for (int64_t j = 0; j < ne11; j++) {
+            const block_q8_1 * xq_j = xq + j * x_stride;
+            float * dst_j = dst_d + j * ne01;
+            switch (src0->type) {
+                case GGML_TYPE_Q3_K: {
                     const dim3 grid((ne01 + 7) / 8, 1, 1);
-                    mul_mat_vec_q8_0_repacked<2, 4, false><<<grid, 256, 0, stream>>>(
-                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    mul_mat_vec_q3k_repacked<false><<<grid, 256, 0, stream>>>(
+                        w, xq_j, dst_j, (uint32_t) ne00, (uint32_t) ne01,
                         nullptr, nullptr, nullptr, 0, 0, 0, 0);
-                }
-            } break;
-            default: GGML_ABORT("unsupported repack type");
+                } break;
+                case GGML_TYPE_Q4_K: {
+                    const dim3 grid((ne01 + 7) / 8, 1, 1);
+                    mul_mat_vec_q4k_repacked<false><<<grid, 256, 0, stream>>>(
+                        w, xq_j, dst_j, (uint32_t) ne00, (uint32_t) ne01,
+                        nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                } break;
+                case GGML_TYPE_Q5_K: {
+                    const dim3 grid((ne01 + 7) / 8, 1, 1);
+                    mul_mat_vec_q5k_repacked<false><<<grid, 256, 0, stream>>>(
+                        w, xq_j, dst_j, (uint32_t) ne00, (uint32_t) ne01,
+                        nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                } break;
+                case GGML_TYPE_Q6_K: {
+                    const dim3 grid((ne01 + 7) / 8, 1, 1);
+                    mul_mat_vec_q6k_repacked<false><<<grid, 256, 0, stream>>>(
+                        w, xq_j, dst_j, (uint32_t) ne00, (uint32_t) ne01,
+                        nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                } break;
+                case GGML_TYPE_Q8_0: {
+                    if (ne01 >= 4096) {
+                        const dim3 grid(ne01, 1, 1);
+                        mul_mat_vec_q8_0_repacked<1, 1, false><<<grid, 64, 0, stream>>>(
+                            w, xq_j, dst_j, (uint32_t) ne00, (uint32_t) ne01,
+                            nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                    } else {
+                        const dim3 grid((ne01 + 7) / 8, 1, 1);
+                        mul_mat_vec_q8_0_repacked<2, 4, false><<<grid, 256, 0, stream>>>(
+                            w, xq_j, dst_j, (uint32_t) ne00, (uint32_t) ne01,
+                            nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                    }
+                } break;
+                default: GGML_ABORT("unsupported repack type");
+            }
         }
         return;
     }
@@ -1942,7 +2041,9 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
-    if (n_tokens > 1) {
+    // compaction only feeds the grouped GEMM (n_tokens > 8). Small-batch
+    // concurrent decode (2..8) loops the raw-ids matvec below and skips it.
+    if (n_tokens > 8) {
         const int si1  = ids->nb[1] / sizeof(int32_t);
         const int sis1 = src1->nb[2] / src1->nb[1];
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data,
@@ -1965,57 +2066,69 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     }
     const block_q8_1 * xq = (const block_q8_1 *) src1_q8_1.get();
 
-    if (n_tokens == 1) {
-        // decode: one matvec per slot; experts read directly from the
-        // raw ids tensor in-kernel (no compaction kernels — launch
-        // parity with canonical mmvq-id). Broadcast src1 (ne[1]==1, one
-        // shared activation column for all slots) uses x-stride 0.
+    if (n_tokens <= 8) {
+        // LEVER 2: small-batch concurrent decode (n_tokens = 1..8). Loop the
+        // tuned single-token matvec once per token instead of the thin 16-wide
+        // grouped GEMM. MoE routing puts ~1 token per expert, so the GEMM tile
+        // is ~15/16 empty at these batch sizes; the per-token matvec keeps the
+        // fast decode path (mirrors the dense LEVER 1 per-column loop). Each
+        // token reads experts directly from its row of the raw ids tensor; no
+        // compaction. n_tokens==1 collapses to the original single-token launch
+        // (grid.y = n_expert_used = n_assign), so decode is byte-unchanged.
         const uint32_t xs_eff = src1->ne[1] == 1 ? 0u : (uint32_t) x_stride;
-        switch (src0->type) {
-            case GGML_TYPE_Q3_K: {
-                const dim3 grid((ne01 + 7) / 8, n_assign, 1);
-                mul_mat_vec_q3k_repacked<true><<<grid, 256, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    (const int32_t *) ids->data, nullptr, nullptr,
-                    (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
-            } break;
-            case GGML_TYPE_Q4_K: {
-                const dim3 grid((ne01 + 7) / 8, n_assign, 1);
-                mul_mat_vec_q4k_repacked<true><<<grid, 256, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    (const int32_t *) ids->data, nullptr, nullptr,
-                    (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
-            } break;
-            case GGML_TYPE_Q5_K: {
-                const dim3 grid((ne01 + 7) / 8, n_assign, 1);
-                mul_mat_vec_q5k_repacked<true><<<grid, 256, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    (const int32_t *) ids->data, nullptr, nullptr,
-                    (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
-            } break;
-            case GGML_TYPE_Q6_K: {
-                const dim3 grid((ne01 + 7) / 8, n_assign, 1);
-                mul_mat_vec_q6k_repacked<true><<<grid, 256, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    (const int32_t *) ids->data, nullptr, nullptr,
-                    (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
-            } break;
-            case GGML_TYPE_Q8_0: {
-                if (ne01 >= 4096) {
-                    const dim3 grid(ne01, n_assign, 1);
-                    mul_mat_vec_q8_0_repacked<1, 1, true><<<grid, 64, 0, stream>>>(
-                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                        (const int32_t *) ids->data, nullptr, nullptr,
+        const uint32_t xs_tok = (uint32_t) (src1->ne[1] * x_stride); // token stride in xq
+        const uint32_t dst_s2 = dst->nb[2] / sizeof(float);          // token stride in dst
+        const int      si1    = ids->nb[1] / sizeof(int32_t);        // token stride in ids
+        for (int64_t t = 0; t < n_tokens; t++) {
+            const block_q8_1 * xq_t  = xq + (size_t) t * xs_tok;
+            float *            dst_t = dst_d + (size_t) t * dst_s2;
+            const int32_t *    ids_t = (const int32_t *) ids->data + t * si1;
+            switch (src0->type) {
+                case GGML_TYPE_Q3_K: {
+                    const dim3 grid((ne01 + 7) / 8, n_expert_used, 1);
+                    mul_mat_vec_q3k_repacked<true><<<grid, 256, 0, stream>>>(
+                        w, xq_t, dst_t, (uint32_t) ne00, (uint32_t) ne01,
+                        ids_t, nullptr, nullptr,
                         (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
-                } else {
-                    const dim3 grid((ne01 + 7) / 8, n_assign, 1);
-                    mul_mat_vec_q8_0_repacked<2, 4, true><<<grid, 256, 0, stream>>>(
-                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                        (const int32_t *) ids->data, nullptr, nullptr,
+                } break;
+                case GGML_TYPE_Q4_K: {
+                    const dim3 grid((ne01 + 7) / 8, n_expert_used, 1);
+                    mul_mat_vec_q4k_repacked<true><<<grid, 256, 0, stream>>>(
+                        w, xq_t, dst_t, (uint32_t) ne00, (uint32_t) ne01,
+                        ids_t, nullptr, nullptr,
                         (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
-                }
-            } break;
-            default: GGML_ABORT("unsupported repack type");
+                } break;
+                case GGML_TYPE_Q5_K: {
+                    const dim3 grid((ne01 + 7) / 8, n_expert_used, 1);
+                    mul_mat_vec_q5k_repacked<true><<<grid, 256, 0, stream>>>(
+                        w, xq_t, dst_t, (uint32_t) ne00, (uint32_t) ne01,
+                        ids_t, nullptr, nullptr,
+                        (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
+                } break;
+                case GGML_TYPE_Q6_K: {
+                    const dim3 grid((ne01 + 7) / 8, n_expert_used, 1);
+                    mul_mat_vec_q6k_repacked<true><<<grid, 256, 0, stream>>>(
+                        w, xq_t, dst_t, (uint32_t) ne00, (uint32_t) ne01,
+                        ids_t, nullptr, nullptr,
+                        (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
+                } break;
+                case GGML_TYPE_Q8_0: {
+                    if (ne01 >= 4096) {
+                        const dim3 grid(ne01, n_expert_used, 1);
+                        mul_mat_vec_q8_0_repacked<1, 1, true><<<grid, 64, 0, stream>>>(
+                            w, xq_t, dst_t, (uint32_t) ne00, (uint32_t) ne01,
+                            ids_t, nullptr, nullptr,
+                            (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
+                    } else {
+                        const dim3 grid((ne01 + 7) / 8, n_expert_used, 1);
+                        mul_mat_vec_q8_0_repacked<2, 4, true><<<grid, 256, 0, stream>>>(
+                            w, xq_t, dst_t, (uint32_t) ne00, (uint32_t) ne01,
+                            ids_t, nullptr, nullptr,
+                            (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
+                    }
+                } break;
+                default: GGML_ABORT("unsupported repack type");
+            }
         }
         return;
     }
