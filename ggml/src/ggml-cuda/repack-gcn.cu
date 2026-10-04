@@ -4744,12 +4744,28 @@ static __global__ void __launch_bounds__(64 * WAVES) mul_mat_vec_q8_0_repacked_l
 template <int NC, int ITERS>
 static void launch_q8_lds_rows(const q8_multi_args & args, const uint32_t rows, const block_q8_1 * xq,
         const uint32_t ne0, const uint32_t x_stride, const size_t lds, const int nsm, cudaStream_t stream) {
-    // tuned on 4x MI50: 4 waves per block up to K = 4096, 8 above (LDS per CU); the prefetch only where
-    // it keeps 4+ waves per SIMD
+    // tuned on 4x MI50 (standalone A/B): 4 waves per block up to K = 4096, 8 above (LDS per CU); prefetch
+    // at 2..3 columns on 4-wave blocks and at 4 columns on 8-wave blocks (K = 6144: 48 vs 54 us, although
+    // it leaves 2 waves per SIMD)
     constexpr int  WAVES = ITERS > 4 ? 8 : 4;
     constexpr bool PF    = WAVES == 4 ? NC <= 3 : NC >= 4;
-    const uint32_t grid  = std::min<uint32_t>((rows + WAVES - 1) / WAVES, (uint32_t) nsm * 32 / WAVES);
-    mul_mat_vec_q8_0_repacked_lds_rows<NC, ITERS, WAVES, PF><<<grid, 64 * WAVES, lds, stream>>>(args, xq, ne0, x_stride, rows);
+    auto kernel = mul_mat_vec_q8_0_repacked_lds_rows<NC, ITERS, WAVES, PF>;
+    // whole rounds of resident blocks (registers and LDS limit residency to 1..6 blocks per CU): one round, two from
+    // 64K rows (2560 x 10240 at 2-4 columns: 91 -> 72 us with one round; the LM head, 248320 rows: 1140 vs 1351 us
+    // with two). GGML_CUDA_Q8_LDS_ROWS_ROUNDS=n forces n
+    static const int rounds_env = getenv("GGML_CUDA_Q8_LDS_ROWS_ROUNDS") ? atoi(getenv("GGML_CUDA_Q8_LDS_ROWS_ROUNDS")) : 0;
+    const int rounds = rounds_env > 0 ? rounds_env : (rows >= 65536 ? 2 : 1);
+    static int per_cu[GGML_CUDA_MAX_DEVICES][64] = {};
+    int device;
+    CUDA_CHECK(cudaGetDevice(&device));
+    const int lds_kb = (int) std::min<size_t>(63, lds / 1024);
+    if (per_cu[device][lds_kb] == 0) {
+        int n = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kernel, 64 * WAVES, (lds_kb + 1) * 1024));
+        per_cu[device][lds_kb] = std::max(n, 1);
+    }
+    const uint32_t grid = std::min<uint32_t>((rows + WAVES - 1) / WAVES, (uint32_t) (nsm * per_cu[device][lds_kb] * rounds));
+    kernel<<<grid, 64 * WAVES, lds, stream>>>(args, xq, ne0, x_stride, rows);
 }
 
 static bool q8_lds_rows_dispatch(const q8_multi_args & args, const uint32_t rows, const block_q8_1 * xq,

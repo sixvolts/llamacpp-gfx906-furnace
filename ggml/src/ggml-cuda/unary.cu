@@ -757,6 +757,9 @@ bool ggml_cuda_op_add_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * a
         return false;
     }
     const int64_t k = ggml_nelements(mul_node);
+    if (k > (int64_t) UINT32_MAX) {
+        return false; // the kernel indexes the broadcast rows with 32 bits
+    }
     const float * sx = nullptr;
     float *       sy = nullptr;
     if (sig != nullptr) {
