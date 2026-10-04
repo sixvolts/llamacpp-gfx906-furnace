@@ -4639,6 +4639,153 @@ static bool q8_lds_nc_dispatch(const q8_multi_args & args, const uint32_t rows, 
     return true;
 }
 
+// Dense Q8_0 with NC = 2..4 columns (MTP verify): the whole activation sits in LDS, loaded once per block,
+// and the blocks loop over the rows. A wave issues all weight loads of its row before the dots; PF also
+// keeps the next row's loads in flight during the dots. The _nc kernels read the activation through L1,
+// where the weight stream evicts it, so each column cost one more L2 read of it per row. Per (row, column)
+// the sums run in the order of mul_mat_vec_q8_0_repacked_nc, so the results are the same.
+template <int NC, int ITERS, int WAVES, bool PF>
+static __global__ void __launch_bounds__(64 * WAVES) mul_mat_vec_q8_0_repacked_lds_rows(
+        const q8_multi_args args, const block_q8_1 * __restrict__ xq, const uint32_t ne0, const uint32_t x_stride,
+        const uint32_t rows) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    extern __shared__ int4 lds_rows_smem[];
+    const uint32_t n_blocks = ne0 >> 5;
+    const uint32_t n_half   = n_blocks * 2;
+    int4  * sx = lds_rows_smem;                                     // [NC][n_half]
+    float * sd = reinterpret_cast<float *>(lds_rows_smem + NC * n_half); // [NC][n_blocks]
+    for (uint32_t e = threadIdx.x; e < NC * n_half; e += 64 * WAVES) {
+        const uint32_t c = e / n_half, hb = e % n_half;
+        const block_q8_1 * xb = xq + (size_t) c * x_stride + (hb >> 1);
+        sx[e] = reinterpret_cast<const int4 *>(xb->qs)[hb & 1];
+        if ((hb & 1) == 0) {
+            sd[c * n_blocks + (hb >> 1)] = __low2float(xb->ds);
+        }
+    }
+    __syncthreads();
+    const uint32_t nsp  = ((n_blocks & (n_blocks - 1u)) == 0u) ? (n_blocks + 1u) : n_blocks;
+    const int      lane = threadIdx.x % 64;
+    const uint32_t step = gridDim.x * WAVES;
+
+    int4     w[ITERS];
+    uint16_t db[ITERS];
+    auto load = [&](const uint32_t grow) {
+        const uint32_t g = grow < rows ? grow : 0;
+        const int      t = g >= args.start[2] ? 2 : (g >= args.start[1] ? 1 : 0);
+        const uint32_t r = g - args.start[t];
+        const int      * qs_int  = reinterpret_cast<const int *>(args.w[t]);
+        const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(args.w[t] + (size_t) args.ne1[t] * nsp * 32);
+#pragma unroll
+        for (int j = 0; j < ITERS; ++j) {
+            const uint32_t hb = lane + j * 64;
+            const uint32_t sb = (hb < n_half ? hb : 0) >> 1, half = hb & 1;
+            w[j]  = *reinterpret_cast<const int4 *>(qs_int + ((size_t) r * nsp + sb) * 8 + half * 4);
+            db[j] = d_plane[(size_t) r * nsp + sb];
+        }
+    };
+    uint32_t grow = blockIdx.x * WAVES + threadIdx.x / 64;
+    if constexpr (PF) {
+        load(grow);
+    }
+    for (; grow < rows; grow += step) {
+        if constexpr (!PF) {
+            load(grow);
+        }
+        int4     wc[ITERS];
+        uint16_t dc[ITERS];
+#pragma unroll
+        for (int j = 0; j < ITERS; ++j) {
+            wc[j] = w[j];
+            dc[j] = db[j];
+        }
+        if constexpr (PF) {
+            if (grow + step < rows) {
+                load(grow + step);
+            }
+        }
+        float acc[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            acc[c] = 0.0f;
+        }
+#pragma unroll
+        for (int j = 0; j < ITERS; ++j) {
+            const uint32_t hb = lane + j * 64;
+            if (hb >= n_half) {
+                break;
+            }
+            const uint32_t sb = hb >> 1;
+            const float    dw = __half2float(*reinterpret_cast<const __half *>(&dc[j]));
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const int4 a = sx[c * n_half + hb];
+                int idot = 0;
+                idot = ggml_cuda_dp4a(wc[j].x, a.x, idot); idot = ggml_cuda_dp4a(wc[j].y, a.y, idot);
+                idot = ggml_cuda_dp4a(wc[j].z, a.z, idot); idot = ggml_cuda_dp4a(wc[j].w, a.w, idot);
+                acc[c] += dw * sd[c * n_blocks + sb] * (float) idot;
+            }
+        }
+        const int      t = grow >= args.start[2] ? 2 : (grow >= args.start[1] ? 1 : 0);
+        const uint32_t r = grow - args.start[t];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const float v = warp_reduce_sum<64>(acc[c]);
+            if (lane == 0) {
+                args.y[t][(size_t) c * args.ne1[t] + r] = v;
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(args, xq, ne0, x_stride, rows);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+template <int NC, int ITERS>
+static void launch_q8_lds_rows(const q8_multi_args & args, const uint32_t rows, const block_q8_1 * xq,
+        const uint32_t ne0, const uint32_t x_stride, const size_t lds, const int nsm, cudaStream_t stream) {
+    // tuned on 4x MI50: 4 waves per block up to K = 4096, 8 above (LDS per CU); the prefetch only where
+    // it keeps 4+ waves per SIMD
+    constexpr int  WAVES = ITERS > 4 ? 8 : 4;
+    constexpr bool PF    = WAVES == 4 ? NC <= 3 : NC >= 4;
+    const uint32_t grid  = std::min<uint32_t>((rows + WAVES - 1) / WAVES, (uint32_t) nsm * 32 / WAVES);
+    mul_mat_vec_q8_0_repacked_lds_rows<NC, ITERS, WAVES, PF><<<grid, 64 * WAVES, lds, stream>>>(args, xq, ne0, x_stride, rows);
+}
+
+static bool q8_lds_rows_dispatch(const q8_multi_args & args, const uint32_t rows, const block_q8_1 * xq,
+        const int64_t ne11, const uint32_t ne0, const uint32_t x_stride, cudaStream_t stream) {
+    static const bool disabled = getenv("GGML_CUDA_NO_Q8_LDS_ROWS") != nullptr;
+    const uint32_t n_blocks = ne0 / 32;
+    const int      iters    = (int) ((2 * n_blocks + 63) / 64);
+    const size_t   lds      = (size_t) ne11 * n_blocks * (2 * sizeof(int4) + sizeof(float));
+    if (disabled || ne11 < 2 || ne11 > 4 || iters < 2 || iters > 6 || lds > 32768 || rows < 2048) {
+        return false;
+    }
+    // 3 columns on 4-wave blocks: the _nc kernel is level or faster below ~6K rows (K = 2048..4096 at 2-4K rows)
+    if (ne11 == 3 && iters <= 4 && rows < 6144) {
+        return false;
+    }
+    int device;
+    CUDA_CHECK(cudaGetDevice(&device));
+    const int nsm = ggml_cuda_info().devices[device].nsm;
+    auto launch = [&](auto nc) {
+        constexpr int NC = decltype(nc)::value;
+        switch (iters) {
+            case 2:  launch_q8_lds_rows<NC, 2>(args, rows, xq, ne0, x_stride, lds, nsm, stream); break;
+            case 3:  launch_q8_lds_rows<NC, 3>(args, rows, xq, ne0, x_stride, lds, nsm, stream); break;
+            case 4:  launch_q8_lds_rows<NC, 4>(args, rows, xq, ne0, x_stride, lds, nsm, stream); break;
+            case 5:  launch_q8_lds_rows<NC, 5>(args, rows, xq, ne0, x_stride, lds, nsm, stream); break;
+            default: launch_q8_lds_rows<NC, 6>(args, rows, xq, ne0, x_stride, lds, nsm, stream); break;
+        }
+    };
+    switch (ne11) {
+        case 2:  launch(std::integral_constant<int, 2>{}); break;
+        case 3:  launch(std::integral_constant<int, 3>{}); break;
+        default: launch(std::integral_constant<int, 4>{}); break;
+    }
+    return true;
+}
+
 // Dense repacked K-quant matvec for NC = 2..8 activation columns (spec-decode verify,
 // short prompt chunks). Before this, ne11 >= 2 went to the int8 MMQ tile GEMM, whose
 // 64-wide N tile made a 2-token batch cost about as much as a 64-token one (~6x a decode
@@ -4923,6 +5070,9 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     q8_multi_args one = {};
                     one.w[0] = w; one.y[0] = dst_d; one.ne1[0] = (uint32_t) ne01;
                     one.start[0] = 0; one.start[1] = UINT32_MAX; one.start[2] = UINT32_MAX;
+                    if (q8_lds_rows_dispatch(one, (uint32_t) ne01, xq, ne11, (uint32_t) ne00, (uint32_t) x_stride, stream)) {
+                        return;
+                    }
                     if (q8_lds_nc_dispatch(one, (uint32_t) ne01, xq, ne11, (uint32_t) ne00, (uint32_t) x_stride, stream)) {
                         return;
                     }
@@ -6147,6 +6297,10 @@ void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tens
     }
     // several columns (speculative verify, several sequences): the nc kernel over the grouped rows
     const int64_t x_stride = ne10_padded / QK8_1;
+    if (q8_lds_rows_dispatch(args, rows, xq, ne11, (uint32_t) ne00, (uint32_t) x_stride, stream)) {
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (q8_lds_nc_dispatch(args, rows, xq, ne11, (uint32_t) ne00, (uint32_t) x_stride, stream)) {
         CUDA_CHECK(cudaGetLastError());
         return;
