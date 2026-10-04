@@ -724,14 +724,17 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
 
 // ADD -> UNARY -> MUL in one launch: op(a + b) * g, the arithmetic of the three ops (the GDN gate
 // softplus(alpha + dt_bias) * ssm_a runs once per recurrent layer per token)
+// b and g may be one row broadcast over the tokens (nb, ng = their element counts)
 template <float (*op)(float)>
 static __global__ void add_unary_mul_kernel(const float * a, const float * b, const float * g, float * dst, const int64_t k,
-        const float * sx, float * sy) {
+        const float * sx, float * sy, const int64_t nb, const int64_t ng) {
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
     if (i >= k) {
         return;
     }
-    dst[i] = op(a[i] + b[i]) * g[i];
+    const uint32_t ib = nb == k ? (uint32_t) i : (uint32_t) i % (uint32_t) nb;
+    const uint32_t ig = ng == k ? (uint32_t) i : (uint32_t) i % (uint32_t) ng;
+    dst[i] = op(a[i] + b[ib]) * g[ig];
     if (sx != nullptr) {
         sy[i] = op_sigmoid(sx[i]); // an independent SIGMOID of the same size, folded into the launch
     }
@@ -744,7 +747,9 @@ bool ggml_cuda_op_add_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * a
     const ggml_tensor * g = mul_node->src[0] == unary_node ? mul_node->src[1] : mul_node->src[0];
     const ggml_tensor * ts[] = { a, b, g, add, unary_node, mul_node };
     for (const ggml_tensor * t : ts) {
-        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, mul_node)) {
+        // b and g: the full shape, or one contiguous row repeated over the other dims (several tokens)
+        const bool row_bcast = (t == b || t == g) && t->ne[0] == mul_node->ne[0] && ggml_nelements(t) == t->ne[0];
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !(ggml_are_same_shape(t, mul_node) || row_bcast)) {
             return false;
         }
     }
@@ -771,10 +776,11 @@ bool ggml_cuda_op_add_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * a
     cudaStream_t stream = ctx.stream();
     const float * ad = (const float *) a->data; const float * bd = (const float *) b->data;
     const float * gd = (const float *) g->data; float * dd = (float *) mul_node->data;
+    const int64_t nbb = ggml_nelements(b), ngg = ggml_nelements(g);
     switch (ggml_get_unary_op(unary_node)) {
-        case GGML_UNARY_OP_SOFTPLUS: add_unary_mul_kernel<op_softplus><<<nb, 256, 0, stream>>>(ad, bd, gd, dd, k, sx, sy); return true;
-        case GGML_UNARY_OP_SILU:     add_unary_mul_kernel<op_silu>    <<<nb, 256, 0, stream>>>(ad, bd, gd, dd, k, sx, sy); return true;
-        case GGML_UNARY_OP_SIGMOID:  add_unary_mul_kernel<op_sigmoid> <<<nb, 256, 0, stream>>>(ad, bd, gd, dd, k, sx, sy); return true;
+        case GGML_UNARY_OP_SOFTPLUS: add_unary_mul_kernel<op_softplus><<<nb, 256, 0, stream>>>(ad, bd, gd, dd, k, sx, sy, nbb, ngg); return true;
+        case GGML_UNARY_OP_SILU:     add_unary_mul_kernel<op_silu>    <<<nb, 256, 0, stream>>>(ad, bd, gd, dd, k, sx, sy, nbb, ngg); return true;
+        case GGML_UNARY_OP_SIGMOID:  add_unary_mul_kernel<op_sigmoid> <<<nb, 256, 0, stream>>>(ad, bd, gd, dd, k, sx, sy, nbb, ngg); return true;
         default: return false;
     }
 }

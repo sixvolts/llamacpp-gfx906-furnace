@@ -456,8 +456,11 @@ static void launch_gated_delta_net(
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
 #if defined(GGML_USE_HIP)
+    // short runs (MTP verify, 2..4 tokens) stay on the register-resident decode kernel below: the LDS
+    // kernel costs ~2.3x a decode step at 3 tokens. GGML_CUDA_GDN_CPW_MAXT sets the longest such run
+    static const int cpw_max_t = getenv("GGML_CUDA_GDN_CPW_MAXT") ? atoi(getenv("GGML_CUDA_GDN_CPW_MAXT")) : 4;
     if constexpr (!KDA) {
-        if (S_v == GDN_LDS_HD && n_tokens > 1 && warp_size == 64) {
+        if (S_v == GDN_LDS_HD && n_tokens > std::max(cpw_max_t, 1) && warp_size == 64) {
             constexpr int cols = 16; // 8: 1.3x slower (7.1 vs 5.6 ms at 2048 tokens, 48 heads)
             const dim3 grid(H, n_seqs, GDN_LDS_HD / cols);
             gated_delta_net_lds_wave64<cols, keep_rs_t><<<grid, 64, 0, stream>>>(
@@ -476,7 +479,7 @@ static void launch_gated_delta_net(
         // one sequence is slightly faster with 2; GGML_CUDA_GDN_CPW=2|4 forces one
         static const int cpw_env = getenv("GGML_CUDA_GDN_CPW") ? atoi(getenv("GGML_CUDA_GDN_CPW")) : 0;
         const int cpw = cpw_env ? cpw_env : (n_seqs >= 2 ? 4 : 2);
-        if (S_v == 128 && warp_size == 64 && n_tokens == 1 && (cpw == 2 || cpw == 4)) {
+        if (S_v == 128 && warp_size == 64 && n_tokens <= std::max(cpw_max_t, 1) && (cpw == 2 || cpw == 4)) {
             const dim3 grid(H, n_seqs, S_v / (num_warps * cpw));
             const dim3 block(64, num_warps, 1);
             if (cpw == 4) {
