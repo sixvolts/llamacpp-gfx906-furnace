@@ -299,7 +299,7 @@ static __global__ void conv_step_concat_f32(const conv_step_args a) {
                 for (int k = 0; k <= SC; k++) {
                     sumf += o[t + k] * wr[k];
                 }
-                sumf += 0.0f;
+                sumf += 0.0f; // the zero bias of ssm_conv_f32 (keeps the sign of a zero sum the same)
                 a.y[((int64_t) b * a.T + t) * a.C + c] = ggml_cuda_op_silu_single(sumf);
             }
         }

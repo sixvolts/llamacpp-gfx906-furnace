@@ -1111,20 +1111,22 @@ bool ggml_cuda_op_hc_post_rms_norm_q8(ggml_backend_cuda_context & ctx, const ggm
     // stream s of token t is one block: an output may sit exactly on the residual (the same threads read and write
     // each element) but not on x, inject or the shared-expert inputs, which every stream of the token reads
     const bool res_same = res->nb[1] == (size_t) n_embd * sizeof(float) && res->nb[2] == (size_t) hc * n_embd * sizeof(float);
-    std::vector<const ggml_tensor *> shared_in = { x, inject };
-    if (sma_b != nullptr) {
-        shared_in.push_back(sma_a);
-        shared_in.push_back(sma_g);
-    }
+    const ggml_tensor * shared_in[4] = { x, inject, sma_a, sma_g };
+    const int n_shared = sma_b != nullptr ? 4 : 2;
     if (ovl(post, mul_tensor)) {
+        return false;
+    }
+    // with the shared-expert combine the caller runs the inject matvec before this kernel, ahead of its place in the
+    // graph: its output may then sit on a, b or g (dead by then in the graph order) and must not
+    if (sma_b != nullptr && (ovl(inject, sma_a) || ovl(inject, sma_b) || ovl(inject, sma_g))) {
         return false;
     }
     for (const ggml_tensor * o : { (const ggml_tensor *) post, (const ggml_tensor *) mul_tensor }) {
         if (ovl(o, res) && !(lo(o) == lo(res) && res_same)) {
             return false;
         }
-        for (const ggml_tensor * in : shared_in) {
-            if (ovl(o, in)) {
+        for (int k = 0; k < n_shared; k++) {
+            if (ovl(o, shared_in[k])) {
                 return false;
             }
         }
