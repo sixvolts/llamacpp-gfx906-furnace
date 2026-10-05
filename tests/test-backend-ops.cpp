@@ -2727,6 +2727,7 @@ struct test_rms_norm_mul_rope : public test_case {
     const bool broadcast; // multiply by a 1D [ne0] weight, as model norm weights are
     const ggml_type set_rows_type;
     int mode;
+    int rope_dims = 0; // rotated dims (0: all of ne[0])
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -2736,7 +2737,7 @@ struct test_rms_norm_mul_rope : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR9(ne, eps, multi_add, mul, rope, set_rows, broadcast, mode, set_rows_type);
+        return VARS_TO_STR10(ne, eps, multi_add, mul, rope, set_rows, broadcast, mode, set_rows_type, rope_dims);
     }
 
     test_rms_norm_mul_rope(std::array<int64_t, 4> ne, float eps = 1e-6f, bool multi_add = false,
@@ -2777,7 +2778,7 @@ struct test_rms_norm_mul_rope : public test_case {
             ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[2] * (is_mrope ? 4 : 1));
 
             if (is_mrope) {
-                const int n_dims = ne[0];
+                const int n_dims = rope_dims > 0 ? rope_dims : ne[0];
                 int sections[4] = { n_dims/3, n_dims/3, n_dims/3, 0 };
                 a = ggml_rope_multi(ctx, a, pos, nullptr, n_dims, sections, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
             } else {
@@ -10149,6 +10150,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
 
+    // qwen4exp attention q/k norm + interleaved M-RoPE (partial rotary), with and without the K cache write
+    for (int mode : { GGML_ROPE_TYPE_IMROPE, GGML_ROPE_TYPE_MROPE }) {
+        for (int dims : { 0, 64 }) {
+            for (bool sr : { false, true }) {
+                for (int64_t nt : { 1, 3 }) {
+                    auto * t = new test_rms_norm_mul_rope({256, sr ? 2 : 24, nt, 1}, 1e-6f, false, sr, true, mode);
+                    t->rope_dims = dims;
+                    test_cases.emplace_back(t);
+                }
+            }
+        }
+    }
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
 
