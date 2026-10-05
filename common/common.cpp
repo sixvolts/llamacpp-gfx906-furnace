@@ -2305,6 +2305,23 @@ common_state_bytes & common_state_bytes::operator=(const common_state_bytes & o)
     return *this;
 }
 
+common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_checkpoint && o) noexcept {
+    if (this != &o) {
+        async_wait();
+        o.async_wait();
+        n_tokens  = o.n_tokens;
+        id_task   = o.id_task;
+        pos_min   = o.pos_min;
+        pos_max   = o.pos_max;
+        data_tgt  = std::move(o.data_tgt);
+        data_dft  = std::move(o.data_dft);
+        data_spec = std::move(o.data_spec);
+        async_ctx    = nullptr;
+        async_handle = -1;
+    }
+    return *this;
+}
+
 common_state_bytes::~common_state_bytes() {
     clear();
 }
@@ -2348,6 +2365,12 @@ void common_state_bytes::resize(size_t size, bool pinned) {
         ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
         ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
         ggml_backend_buffer_t b = buft ? ggml_backend_buft_alloc_buffer(buft, size) : nullptr;
+        // a host buffer type falls back to a plain CPU buffer when pinning fails: that memory is pageable, and an
+        // async device copy into it is the stale-pinning fault this storage exists to avoid
+        if (b != nullptr && ggml_backend_buffer_get_type(b) != buft) {
+            ggml_backend_buffer_free(b);
+            b = nullptr;
+        }
         if (b != nullptr) {
             buf = b;
             ptr = (uint8_t *) ggml_backend_buffer_get_base(b);
@@ -2389,6 +2412,15 @@ void common_prompt_checkpoint::update_tgt(
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
     data_tgt.resize(ckpt_size, async);
+    if (async && !data_tgt.pinned()) {
+        // no page-locked memory: copy synchronously (through the backend's pinned bounce buffer)
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOG_WRN("%s: pinned allocation of %zu bytes failed, checkpoints fall back to synchronous copies\n", __func__, ckpt_size);
+        }
+        async = false;
+    }
 
     size_t n = 0;
     if (async) {

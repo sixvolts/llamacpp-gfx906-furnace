@@ -816,7 +816,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 struct ggml_cuda_bounce_buffer {
     static constexpr size_t CHUNK = 8u << 20;
     std::mutex   mtx;
-    char       * host = nullptr; // 2 x CHUNK
+    std::atomic<char *> host { nullptr }; // 2 x CHUNK; published after the events, read without the lock
     cudaEvent_t  ev[2] = { nullptr, nullptr };
 };
 
@@ -827,9 +827,9 @@ static ggml_cuda_bounce_buffer * ggml_cuda_get_bounce(int device) {
     }
     static ggml_cuda_bounce_buffer bufs[GGML_CUDA_MAX_DEVICES];
     ggml_cuda_bounce_buffer & b = bufs[device];
-    if (b.host == nullptr) {
+    if (b.host.load(std::memory_order_acquire) == nullptr) {
         std::lock_guard<std::mutex> lock(b.mtx);
-        if (b.host == nullptr) {
+        if (b.host.load(std::memory_order_relaxed) == nullptr) {
             void * p = nullptr;
             if (cudaHostAlloc(&p, 2 * ggml_cuda_bounce_buffer::CHUNK, cudaHostAllocPortable) != cudaSuccess) {
                 (void) cudaGetLastError();
@@ -838,7 +838,7 @@ static ggml_cuda_bounce_buffer * ggml_cuda_get_bounce(int device) {
             for (auto & e : b.ev) {
                 CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
             }
-            b.host = (char *) p;
+            b.host.store((char *) p, std::memory_order_release);
         }
     }
     return &b;

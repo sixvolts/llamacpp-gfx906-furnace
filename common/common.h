@@ -1181,6 +1181,8 @@ struct common_state_bytes {
     bool empty() const { return n == 0; }
     void resize(size_t size, bool pinned = false);
     void clear();
+    // true when the bytes live in page-locked memory (resize can fall back to pageable storage)
+    bool pinned() const { return buf != nullptr; }
 
 private:
     uint8_t *            ptr = nullptr;
@@ -1209,8 +1211,10 @@ struct common_prompt_checkpoint {
     // a copy waits for the source's asynchronous copy first and owns plain, completed bytes
     common_prompt_checkpoint(const common_prompt_checkpoint & o) { *this = o; }
     common_prompt_checkpoint & operator=(const common_prompt_checkpoint & o);
-    common_prompt_checkpoint(common_prompt_checkpoint &&) = default;
-    common_prompt_checkpoint & operator=(common_prompt_checkpoint &&) = default;
+    // a move waits for any copy still in flight into either object, so a pinned buffer is never freed or handed
+    // over while the device writes it
+    common_prompt_checkpoint(common_prompt_checkpoint && o) noexcept { *this = std::move(o); }
+    common_prompt_checkpoint & operator=(common_prompt_checkpoint && o) noexcept;
     ~common_prompt_checkpoint();
 
     // wait for the asynchronous copy, if any
