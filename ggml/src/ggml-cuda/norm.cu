@@ -215,6 +215,101 @@ static __global__ void rms_norm_mul_q8_f32(const float * x, float * dst, const i
     }
 }
 
+// GDN output gate: RMS_NORM -> MUL(w) -> MUL(sigmoid(z)) in one kernel, plus q8_1 blocks when yq != nullptr.
+// Same operation order as rms_norm_f32<256, true> and unary_gated_q8_kernel<op_sigmoid>, so results are identical.
+static __global__ void __launch_bounds__(256) rms_norm_mul_sigmoid_gate_f32(
+        const float * x, const int64_t sx1, const int64_t sx2, const int64_t sx3, const float * __restrict__ mul, const int64_t smul1,
+        const float * z, const int64_t sz1, float * dst, const int ncols, const float eps, block_q8_1 * __restrict__ yq) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x += sample*sx3 + channel*sx2 + row*sx1;
+    const int64_t lrow = ((int64_t) sample*nchannels + channel)*nrows + row;
+    const float * zr = z + lrow*sz1;
+    const float * mr = mul + row*smul1;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += 256) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += 256) {
+        const float nv = scale * x[col] * mr[col];
+        const float v  = (1.0f / (1.0f + expf(-zr[col]))) * nv;
+        dst[lrow*ncols + col] = v;
+        if (yq != nullptr) {
+            rms_emit_q8_1(yq, lrow*ncols + col, v);
+        }
+    }
+}
+
+// b + a * sigmoid(g) exactly as sigmoid_mul_add_f32 computes it: no contraction anywhere, including the expf
+// expansion (contract(off) changes its lowering too)
+static __device__ __forceinline__ float hc_sma_combine(const float b, const float a, const float g) {
+#pragma clang fp contract(off)
+    const float s = 1.0f / (1.0f + expf(-g));
+    return b + a * s;
+}
+
+// qwen4exp hc combine + the next hc mix norm, one block per (stream, token): w = s_out * sigmoid(s_in * inject),
+// post = x * w + residual (dsv4_hc_post_f32), then RMS_NORM -> MUL -> q8_1 (rms_norm_mul_q8_f32<1024>). SMA: x is the
+// shared-expert combine b + a * sigmoid(g[token]) (sigmoid_mul_add_f32). Each step keeps the operation order of the
+// kernel it replaces, so the results are identical.
+template <int HC, bool SMA>
+static __global__ void __launch_bounds__(1024) hc_post_rms_norm_mul_q8_f32(
+        const float * inject, const int64_t sinj, const float * x, const int64_t sx1, const float * sma_a, const float * sma_g,
+        const float * residual, const int64_t sr1, const int64_t sr2, float * post, const float s_in, const float s_out,
+        const float * __restrict__ mul, float * dst, const int ncols, const float eps, block_q8_1 * __restrict__ yq) {
+    const int s   = blockIdx.x;
+    const int it  = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const float   w  = s_out / (1.0f + expf(-s_in * inject[s + it * sinj]));
+    const float * xr = x + it * sx1;
+    const float * rr = residual + s * sr1 + it * sr2;
+    const int64_t off = ((int64_t) it * HC + s) * ncols;
+    float * pr = post + off;
+    // post first (dsv4_hc_post_f32), each thread writes and re-reads only its own columns
+    for (int col = tid; col < ncols; col += 1024) {
+        const float xv = SMA ? hc_sma_combine(xr[col], sma_a[it * sx1 + col], sma_g[it]) : xr[col];
+        float sum = xv * w;
+        sum += rr[col];
+        pr[col] = sum;
+    }
+    // then rms_norm_mul_q8_f32<1024> on the post row, in its source form
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += 1024) {
+        const float xi = pr[col];
+        tmp += xi * xi;
+    }
+
+    __shared__ float s_sum[32];
+    tmp = block_reduce<block_reduce_method::SUM, 1024>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    const float * mr = mul + (int64_t) s * ncols;
+    for (int col = tid; col < ncols; col += 1024) {
+        const float v = scale * pr[col] * mr[col];
+        dst[off + col] = v;
+        if (yq != nullptr) {
+            rms_emit_q8_1(yq, off + col, v);
+        }
+    }
+}
+
 // residual ADD -> RMS_NORM -> MUL in one kernel: writes the sum (the residual stream, still read later)
 // and the normed activation, plus q8_1 blocks when yq != nullptr. Each thread reads a, b at a column
 // before writing sum there, and the block reduction separates the two passes, so sum may alias a or b
@@ -984,4 +1079,92 @@ void ggml_cuda_op_rms_norm_scale(ggml_backend_cuda_context & ctx, ggml_tensor * 
     } else {
         rms_norm_scale_f32<1024><<<blocks_num, 1024, 32 * sizeof(float), stream>>>(x, y, ne00, s01, s02, s03, eps, s, b);
     }
+}
+
+bool ggml_cuda_op_hc_post_rms_norm_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * inject, ggml_tensor * post,
+        const float s_in, const float s_out, const ggml_tensor * norm, ggml_tensor * mul_tensor, void * yq,
+        const ggml_tensor * sma_g, const ggml_tensor * sma_a, const ggml_tensor * sma_b, const bool dry) {
+    const ggml_tensor * x   = sma_b != nullptr ? sma_b : post->src[0];
+    const ggml_tensor * res = post->src[1];
+    const ggml_tensor * w   = mul_tensor->src[0] == norm ? mul_tensor->src[1] : mul_tensor->src[0];
+    const int64_t n_embd = post->ne[0];
+    const int64_t hc     = post->ne[1];
+    const int64_t nt     = post->ne[2];
+    if (post->src[3] != nullptr || norm->src[0] != post || hc != 4 || n_embd != 2560 || post->ne[3] != 1 ||
+            inject->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || res->type != GGML_TYPE_F32 ||
+            w->type != GGML_TYPE_F32 || post->type != GGML_TYPE_F32 || mul_tensor->type != GGML_TYPE_F32 ||
+            inject->ne[0] != hc || inject->ne[1] != nt || inject->nb[0] != sizeof(float) ||
+            x->ne[0] != n_embd || x->ne[1] != nt || x->nb[0] != sizeof(float) ||
+            res->ne[0] != n_embd || res->ne[1] != hc || res->ne[2] != nt || res->nb[0] != sizeof(float) ||
+            !ggml_is_contiguous(post) || !ggml_is_contiguous(mul_tensor) || !ggml_are_same_shape(post, mul_tensor) ||
+            !ggml_is_contiguous(w) || w->ne[0] != n_embd || w->ne[1] != hc || w->ne[2] != 1 || w->ne[3] != 1) {
+        return false;
+    }
+    if (sma_b != nullptr && (sma_a->type != GGML_TYPE_F32 || sma_g->type != GGML_TYPE_F32 || !ggml_are_same_shape(sma_a, sma_b) ||
+            sma_a->nb[0] != sizeof(float) || sma_a->nb[1] != sma_b->nb[1] || sma_g->ne[0] != 1 || sma_g->ne[1] != nt ||
+            !ggml_is_contiguous(sma_g))) {
+        return false;
+    }
+    auto lo  = [](const ggml_tensor * t) { return (const char *) t->data; };
+    auto hi  = [](const ggml_tensor * t) { return (const char *) t->data + ggml_nbytes(t); };
+    auto ovl = [&](const ggml_tensor * a, const ggml_tensor * b) { return lo(a) < hi(b) && lo(b) < hi(a); };
+    // stream s of token t is one block: an output may sit exactly on the residual (the same threads read and write
+    // each element) but not on x, inject or the shared-expert inputs, which every stream of the token reads
+    const bool res_same = res->nb[1] == (size_t) n_embd * sizeof(float) && res->nb[2] == (size_t) hc * n_embd * sizeof(float);
+    std::vector<const ggml_tensor *> shared_in = { x, inject };
+    if (sma_b != nullptr) {
+        shared_in.push_back(sma_a);
+        shared_in.push_back(sma_g);
+    }
+    if (ovl(post, mul_tensor)) {
+        return false;
+    }
+    for (const ggml_tensor * o : { (const ggml_tensor *) post, (const ggml_tensor *) mul_tensor }) {
+        if (ovl(o, res) && !(lo(o) == lo(res) && res_same)) {
+            return false;
+        }
+        for (const ggml_tensor * in : shared_in) {
+            if (ovl(o, in)) {
+                return false;
+            }
+        }
+    }
+    if (dry) {
+        return true;
+    }
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    const bool sma = sma_b != nullptr;
+    auto kernel = sma ? hc_post_rms_norm_mul_q8_f32<4, true> : hc_post_rms_norm_mul_q8_f32<4, false>;
+    kernel<<<dim3(hc, nt), 1024, 0, ctx.stream()>>>(
+        (const float *) inject->data, inject->nb[1] / sizeof(float), (const float *) x->data, x->nb[1] / sizeof(float),
+        sma ? (const float *) sma_a->data : nullptr, sma ? (const float *) sma_g->data : nullptr,
+        (const float *) res->data, res->nb[1] / sizeof(float), res->nb[2] / sizeof(float),
+        (float *) post->data, s_in, s_out, (const float *) w->data, (float *) mul_tensor->data, (int) n_embd, eps, (block_q8_1 *) yq);
+    return true;
+}
+
+bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul_tensor,
+        ggml_tensor * sig, ggml_tensor * gate_mul, void * yq) {
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * w = mul_tensor->src[0] == norm ? mul_tensor->src[1] : mul_tensor->src[0];
+    const ggml_tensor * z = sig->src[0];
+    const int64_t ncols = x->ne[0];
+    const bool w_bcast = ggml_nelements(w) == ncols;
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || z->type != GGML_TYPE_F32 || gate_mul->type != GGML_TYPE_F32 ||
+            x->nb[0] != sizeof(float) || z->nb[0] != sizeof(float) || !ggml_is_contiguous(w) || ncols > 256 || ncols % QK8_1 != 0 ||
+            !(w_bcast || (w->ne[0] == ncols && w->ne[1] == x->ne[1] && ggml_nelements(w) == ncols * x->ne[1])) ||
+            !ggml_is_contiguous(gate_mul) || ggml_nelements(z) != ggml_nelements(gate_mul) || z->ne[0] != ncols ||
+            z->nb[2] != z->ne[1] * z->nb[1] || z->nb[3] != z->ne[2] * z->nb[2] ||
+            !ggml_are_same_shape(mul_tensor, x) || !ggml_are_same_shape(gate_mul, mul_tensor)) {
+        return false;
+    }
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    const dim3 blocks_num(x->ne[1], x->ne[2], x->ne[3]);
+    rms_norm_mul_sigmoid_gate_f32<<<blocks_num, 256, 32 * sizeof(float), ctx.stream()>>>(
+        (const float *) x->data, x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), x->nb[3] / sizeof(float),
+        (const float *) w->data, w_bcast ? 0 : ncols, (const float *) z->data, z->nb[1] / sizeof(float),
+        (float *) gate_mul->data, (int) ncols, eps, (block_q8_1 *) yq);
+    return true;
 }

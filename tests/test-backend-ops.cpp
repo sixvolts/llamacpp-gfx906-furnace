@@ -4534,6 +4534,83 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+// qwen4exp hc combine + next hc mix norm: MUL_MAT(inject) -> SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL
+// (one launch on some backends)
+struct test_hc_post_norm : public test_dsv4_hc {
+    const int64_t n_tokens;
+    const bool    sma; // block output = b + a * sigmoid(g) (the shared-expert combine)
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_POST_NORM";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_tokens, sma);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_hc_post_norm(int64_t n_tokens = 1, bool sma = false) : n_tokens(n_tokens), sma(sma) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_embd = 2560;
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd * hc, hc);
+        ggml_set_name(a, "base");
+        ggml_tensor * xin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd * hc, n_tokens);
+        ggml_set_name(xin, "x_in");
+        ggml_tensor * inj = ggml_mul_mat(ctx, a, xin);
+        ggml_tensor * w = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inj, 1.0f/hc)), 2.0f);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        if (sma) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(a, "residual");
+            ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
+            ggml_set_name(g, "gate");
+            x = ggml_add(ctx, x, ggml_mul(ctx, a, ggml_sigmoid(ctx, g)));
+        }
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * post = ggml_dsv4_hc_post(ctx, x, residual, w, nullptr);
+        ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(gamma, "weights");
+        out = ggml_mul(ctx, ggml_rms_norm(ctx, post, 1e-6f), gamma);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GDN output gate: RMS_NORM -> MUL(w) -> MUL(SIGMOID(z)) (one launch on some backends)
+struct test_gate_norm : public test_case {
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATE_NORM";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR1(n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_gate_norm(int64_t n_tokens = 1) : n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 48, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+        ggml_set_name(w, "w");
+        ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 48, n_tokens);
+        ggml_set_name(z, "z");
+        ggml_tensor * out = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w), ggml_sigmoid(ctx, z));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // RMS_NORM -> SCALE and SCALE -> SILU chains (fused on some backends)
 struct test_norm_scale_chain : public test_case {
     const std::array<int64_t, 4> ne;
@@ -9313,6 +9390,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 1, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, false, true));
+    for (int64_t nt : { 1, 3 }) {
+        test_cases.emplace_back(new test_hc_post_norm(nt));
+        test_cases.emplace_back(new test_hc_post_norm(nt, true));
+        test_cases.emplace_back(new test_gate_norm(nt));
+    }
     test_cases.emplace_back(new test_norm_scale_chain({128, 16, 1, 1}, true));
     test_cases.emplace_back(new test_norm_scale_chain({128, 32, 3, 2}, true));
     test_cases.emplace_back(new test_norm_scale_chain({4096, 5, 1, 1}, true));

@@ -4475,6 +4475,49 @@ static bool ggml_cuda_match_qsa_score(const ggml_cgraph * cgraph, int i, ggml_cu
     return true;
 }
 
+// SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL at node i (qwen4exp hc combine weights, combine and the
+// next hc mix norm) in one launch; sma_*: the block output is the shared-expert combine SIGMOID -> MUL -> ADD, folded
+// in (the caller checks that DSV4_HC_POST reads it). Returns the number of nodes after i it covered, 0 = not fused.
+// dry: only report whether it would run (nothing launched)
+static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
+        const ggml_tensor * sma_g, const ggml_tensor * sma_a, const ggml_tensor * sma_b, bool dry = false) {
+    static const bool no_hc_norm = getenv("GGML_CUDA_NO_HC_POST_NORM_FUSION") != nullptr;
+    if (no_hc_norm || i + 5 >= cgraph->n_nodes || !ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE })) {
+        return 0;
+    }
+    ggml_tensor * sc1  = cgraph->nodes[i];
+    ggml_tensor * sig  = cgraph->nodes[i + 1];
+    ggml_tensor * sc2  = cgraph->nodes[i + 2];
+    ggml_tensor * post = cgraph->nodes[i + 3];
+    ggml_tensor * norm = cgraph->nodes[i + 4];
+    ggml_tensor * mul  = cgraph->nodes[i + 5];
+    float s_in, b_in, s_out, b_out;
+    memcpy(&s_in,  (const float *) sc1->op_params + 0, sizeof(float));
+    memcpy(&b_in,  (const float *) sc1->op_params + 1, sizeof(float));
+    memcpy(&s_out, (const float *) sc2->op_params + 0, sizeof(float));
+    memcpy(&b_out, (const float *) sc2->op_params + 1, sizeof(float));
+    if (ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || b_in != 0.0f || b_out != 0.0f ||
+            post->op != GGML_OP_DSV4_HC_POST || post->src[2] != sc2 || !ggml_node_has_n_uses(cgraph, i + 2, 1) ||
+            norm->op != GGML_OP_RMS_NORM || norm->src[0] != post || !ggml_node_has_n_uses(cgraph, i + 4, 1) ||
+            mul->op != GGML_OP_MUL || (mul->src[0] != norm && mul->src[1] != norm) ||
+            !(post->flags & GGML_TENSOR_FLAG_COMPUTE) || !(norm->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !(mul->flags & GGML_TENSOR_FLAG_COMPUTE) || !ggml_are_same_stride(sc1->src[0], sc2)) {
+        return 0;
+    }
+    // the launcher checks which overlaps of outputs and inputs its kernel tolerates
+    if (dry) {
+        return ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, s_out, norm, mul, nullptr, sma_g, sma_a, sma_b, true) ? 5 : 0;
+    }
+    void * yq = ggml_cuda_repack_xq_emit_target(*cuda_ctx, cgraph, mul);
+    if (ggml_cuda_op_hc_post_rms_norm_q8(*cuda_ctx, sc1->src[0], post, s_in, s_out, norm, mul, yq, sma_g, sma_a, sma_b)) {
+        return 5;
+    }
+    if (yq != nullptr) {
+        ggml_cuda_repack_xq_invalidate(*cuda_ctx, mul, true);
+    }
+    return 0;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4535,6 +4578,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_nrows(g) == ggml_nrows(add) && ggml_are_same_shape(a, add) && ggml_are_same_shape(b, add) &&
                     ggml_are_same_shape(mul, add) && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
                     ggml_is_contiguous(add) && ggml_cuda_fusion_inputs_ok(add, { a, b }, { g })) {
+                // the combine feeding a qwen4exp hc boundary (SIGMOID -> MUL -> ADD, MUL_MAT(hc inject), SCALE -> ..
+                // -> DSV4_HC_POST(ADD) -> RMS_NORM -> MUL): the inject matvec runs first (it does not read the
+                // combine), the combine and the boundary in one launch
+                static const bool no_hc_sma = getenv("GGML_CUDA_NO_HC_SMA_FUSION") != nullptr;
+                ggml_tensor * inj = i + 9 < cgraph->n_nodes ? cgraph->nodes[i + 3] : nullptr;
+                if (!no_hc_sma && inj != nullptr && ggml_node_has_n_uses(cgraph, i + 2, 1) && inj->op == GGML_OP_MUL_MAT &&
+                        (inj->flags & GGML_TENSOR_FLAG_COMPUTE) && inj->src[0] != add && inj->src[1] != add &&
+                        cgraph->nodes[i + 4]->src[0] == inj && cgraph->nodes[i + 7]->op == GGML_OP_DSV4_HC_POST &&
+                        cgraph->nodes[i + 7]->src[0] == add && cgraph->nodes[i + 7]->src[1] != add) {
+                    // checked first: once the inject ran, the fused launch must follow
+                    if (ggml_cuda_try_hc_post_norm(cuda_ctx, cgraph, i + 4, g, a, b, true) > 0 &&
+                            ggml_cuda_compute_forward(*cuda_ctx, inj)) {
+                        ggml_cuda_repack_xq_invalidate(*cuda_ctx, inj);
+                        const int n_hc = ggml_cuda_try_hc_post_norm(cuda_ctx, cgraph, i + 4, g, a, b);
+                        GGML_ASSERT(n_hc > 0);
+                        return 4 + n_hc;
+                    }
+                }
                 ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, g, a, b, add);
                 return 2;
             }
@@ -4590,6 +4651,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_is_contiguous(cgraph->nodes[i + 1]) && ggml_cuda_fusion_inputs_ok(cgraph->nodes[i + 1], { node->src[0] }, {})) {
         ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    // SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL (qwen4exp hc combine + next hc mix norm): one launch
+    if (node->op == GGML_OP_SCALE) {
+        const int n_hc = ggml_cuda_try_hc_post_norm(cuda_ctx, cgraph, i, nullptr, nullptr, nullptr);
+        if (n_hc > 0) {
+            return n_hc;
+        }
     }
 
     // SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST (qwen4exp hc combine weights): computed inside hc_post
@@ -5371,6 +5440,42 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             if (yq != nullptr) {
                 ggml_cuda_repack_xq_invalidate(*cuda_ctx, mul_node, true);
+            }
+        }
+    }
+
+    // RMS_NORM -> MUL(w) -> [views] -> SIGMOID(z) -> MUL (GDN output gate) in one launch
+    if (node->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        static const bool no_gate_norm = getenv("GGML_CUDA_NO_GATE_NORM_FUSION") != nullptr;
+        int j = i + 2;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            j++;
+        }
+        ggml_tensor * mul  = cgraph->nodes[i + 1];
+        ggml_tensor * sig  = j + 1 < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
+        ggml_tensor * gmul = j + 1 < cgraph->n_nodes ? cgraph->nodes[j + 1] : nullptr;
+        if (!no_gate_norm && sig != nullptr && ggml_node_has_n_uses(cgraph, i + 1, 1) &&
+                sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && ggml_node_has_n_uses(cgraph, j, 1) &&
+                gmul->op == GGML_OP_MUL && ((gmul->src[0] == mul && gmul->src[1] == sig) || (gmul->src[0] == sig && gmul->src[1] == mul)) &&
+                (sig->flags & GGML_TENSOR_FLAG_COMPUTE) && (gmul->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            // a thread reads x and z at a column before it writes the output there: the output may sit
+            // exactly on x or z (same row layout), never partly over them
+            const ggml_tensor * x = node->src[0];
+            const ggml_tensor * z = sig->src[0];
+            auto ok_alias = [&](const ggml_tensor * in) {
+                const char * a0 = (const char *) gmul->data; const char * a1 = a0 + ggml_nbytes(gmul);
+                const char * b0 = (const char *) in->data;   const char * b1 = b0 + ggml_nbytes(in);
+                return !(a0 < b1 && b0 < a1) || (a0 == b0 && ggml_is_contiguous(in) && ggml_nelements(in) == ggml_nelements(gmul));
+            };
+            const ggml_tensor * w = mul->src[0] == node ? mul->src[1] : mul->src[0];
+            if (ok_alias(x) && ok_alias(z) && ok_alias(w)) {
+                void * yq = ggml_cuda_repack_xq_emit_target(*cuda_ctx, cgraph, gmul);
+                if (ggml_cuda_op_rms_norm_mul_sigmoid_gate(*cuda_ctx, node, mul, sig, gmul, yq)) {
+                    return j + 1 - i;
+                }
+                if (yq != nullptr) {
+                    ggml_cuda_repack_xq_invalidate(*cuda_ctx, gmul, true);
+                }
             }
         }
     }
