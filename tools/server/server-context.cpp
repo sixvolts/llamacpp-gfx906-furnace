@@ -2395,8 +2395,21 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, params_base.ctx_checkpoints_async);
-        common_speculative_flush(spec.get()); // the draft state must include any postponed catch-up
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // an MTP / simple draft whose memory supports partial seq_rm (plain KV, e.g. the MTP head of a hybrid target)
+        // has no state the checkpoint must hold: its cell P depends only on tokens <= P, so a restore trims its KV in
+        // place together with the target's attention layers. Saving it would copy the draft's whole KV and wait for the
+        // postponed catch-up, which drains the target pipeline. Eagle3 / DFlash drafts keep the old path (eagle3's
+        // boundary cell pairs token P+1 with P). LLAMA_CKPT_DFT_ALL=1 always saves the draft.
+        static const bool ckpt_dft_all = getenv("LLAMA_CKPT_DFT_ALL") != nullptr;
+        const bool dft_trim_only = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && !ckpt_dft_all &&
+            std::none_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](common_speculative_type t) {
+                return t != COMMON_SPECULATIVE_TYPE_DRAFT_MTP && t != COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE &&
+                       t != COMMON_SPECULATIVE_TYPE_NONE && t < COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE;
+            });
+        if (ctx_dft && !dft_trim_only) {
+            common_speculative_flush(spec.get()); // the draft state must include any postponed catch-up
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
