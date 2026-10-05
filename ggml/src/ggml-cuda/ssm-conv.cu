@@ -237,6 +237,9 @@ struct conv_step_args {
     float *         out;       // concat, contiguous [state_cols + T, C, n_seqs]
     int             C, T, n_seqs, n_cpy;
     conv_step_cpy   cpy[CONV_STEP_MAX_CPY];
+    const float *   conv_w;    // fused SSM_CONV -> SILU: weights [SC + 1, C] (row stride conv_w_nb1); else nullptr
+    int64_t         conv_w_nb1;
+    float *         y;         // silu(conv) output, contiguous [C, T, n_seqs]
 };
 
 template <int SC>
@@ -280,6 +283,24 @@ static __global__ void conv_step_concat_f32(const conv_step_args a) {
 #pragma unroll
             for (int k = 0; k < SC; k++) {
                 d[k] = from[k];
+            }
+        }
+        if (a.conv_w != nullptr) {
+            // ssm_conv_f32<true> arithmetic: sum over the window in tap order, + 0 bias, silu
+            const float * w = (const float *) ((const char *) a.conv_w + (int64_t) c * a.conv_w_nb1);
+            float wr[SC + 1];
+#pragma unroll
+            for (int k = 0; k <= SC; k++) {
+                wr[k] = w[k];
+            }
+            for (int t = 0; t < a.T; t++) {
+                float sumf = 0.0f;
+#pragma unroll
+                for (int k = 0; k <= SC; k++) {
+                    sumf += o[t + k] * wr[k];
+                }
+                sumf += 0.0f;
+                a.y[((int64_t) b * a.T + t) * a.C + c] = ggml_cuda_op_silu_single(sumf);
             }
         }
     }
@@ -426,7 +447,94 @@ int ggml_cuda_try_conv_step_fusion(ggml_backend_cuda_context & ctx, const ggml_c
         a.n_cpy++;
         last = k;
     }
+    // the SSM_CONV -> SILU that reads the concat, when only views sit between it and the last CPY
+    static const bool no_conv = getenv("GGML_CUDA_NO_CONV_STEP_CONV") != nullptr;
+    int k = last + 1;
+    while (k < cgraph->n_nodes && (ggml_cuda_is_view_or_noop_public(cgraph->nodes[k]) || ggml_is_empty(cgraph->nodes[k]))) {
+        k++;
+    }
+    if (!no_conv && k + 1 < cgraph->n_nodes) {
+        const ggml_tensor * conv = cgraph->nodes[k];
+        const ggml_tensor * silu = cgraph->nodes[k + 1];
+        const ggml_tensor * w    = conv->src[1];
+        if (conv->op == GGML_OP_SSM_CONV && conv->src[0] == cat && w->type == GGML_TYPE_F32 && w->ne[0] == SC + 1 &&
+                w->ne[1] == C && w->nb[0] == sizeof(float) && conv->type == GGML_TYPE_F32 && ggml_is_contiguous(conv) &&
+                conv->ne[0] == C && conv->ne[1] == T && conv->ne[2] == ns &&
+                silu->op == GGML_OP_UNARY && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == conv &&
+                ggml_is_contiguous(silu) && silu->type == GGML_TYPE_F32 && ggml_node_has_n_uses(cgraph, k, 1) &&
+                (conv->flags & GGML_TENSOR_FLAG_COMPUTE) && (silu->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            // other threads still read x, the state and the concat while one writes y: no overlap allowed
+            auto ovl = [&](const ggml_tensor * t) {
+                const char * a0 = (const char *) silu->data; const char * a1 = a0 + ggml_nbytes(silu);
+                const char * b0 = (const char *) t->data;    const char * b1 = b0 + ggml_nbytes(t);
+                return a0 < b1 && b0 < a1;
+            };
+            // y on top of x is fine when the layouts match: each thread then overwrites only elements it has read
+            const bool x_alias = silu->data == x->data && x->nb[0] == (size_t) C * sizeof(float) && x->nb[1] == sizeof(float) &&
+                x->nb[2] == (size_t) T * C * sizeof(float);
+            bool clash = (ovl(x) && !x_alias) || ovl(cat) || ovl(w) || (a.cache == nullptr && ovl(s0));
+            if (a.cache != nullptr) {
+                clash = clash || ovl(gr->src[0]) || ovl(gr->src[1]);
+            }
+            if (!clash) {
+                a.conv_w     = (const float *) w->data;
+                a.conv_w_nb1 = w->nb[1];
+                a.y          = (float *) silu->data;
+                last         = k + 1;
+            }
+        }
+    }
     const int nt = 256;
     conv_step_concat_f32<3><<<(C + nt - 1) / nt, nt, 0, ctx.stream()>>>(a);
     return last - i;
+}
+
+// graph_optimize part of the fused conv step: the SSM_CONV -> SILU that reads the step's CONCAT comes a few nodes
+// later (the recurrent-state gather and reset sit between). Move it right behind the CONCAT's state-tail CPYs so
+// ggml_cuda_try_conv_step_fusion sees it (which checks the SILU output against what the step reads). Runs before
+// allocation; the moved nodes need only the CONCAT and the conv weights, both ready at the new position.
+void ggml_cuda_conv_step_graph_optimize(ggml_cgraph * cgraph) {
+    static const bool disabled = getenv("GGML_CUDA_NO_CONV_STEP_FUSION") != nullptr || getenv("GGML_CUDA_NO_CONV_STEP_CONV") != nullptr;
+    if (disabled) {
+        return;
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * cat = cgraph->nodes[i];
+        if (!conv_step_concat_ok(cat)) {
+            continue;
+        }
+        int last = i;
+        for (int k = i + 1; k < cgraph->n_nodes; k++) {
+            const ggml_tensor * n = cgraph->nodes[k];
+            if (ggml_cuda_is_view_or_noop_public(n) || ggml_is_empty(n)) {
+                continue;
+            }
+            if (n->op != GGML_OP_CPY || n->src[0]->view_src != cat) {
+                break;
+            }
+            last = k;
+        }
+        // the conv and its SILU within a short window, nothing between them
+        int ic = -1;
+        for (int k = last + 1; k < cgraph->n_nodes && k <= last + 32; k++) {
+            if (cgraph->nodes[k]->op == GGML_OP_SSM_CONV && cgraph->nodes[k]->src[0] == cat) {
+                ic = k;
+                break;
+            }
+        }
+        if (ic < 0 || ic + 1 >= cgraph->n_nodes) {
+            continue;
+        }
+        ggml_tensor * conv = cgraph->nodes[ic];
+        ggml_tensor * silu = cgraph->nodes[ic + 1];
+        if (silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != conv) {
+            continue;
+        }
+        for (int k = ic + 1; k > last + 2; k--) {
+            cgraph->nodes[k] = cgraph->nodes[k - 2];
+        }
+        cgraph->nodes[last + 1] = conv;
+        cgraph->nodes[last + 2] = silu;
+        i = last + 2;
+    }
 }
