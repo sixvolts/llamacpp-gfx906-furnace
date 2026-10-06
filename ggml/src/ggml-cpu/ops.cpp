@@ -8545,6 +8545,89 @@ void ggml_compute_forward_argsort(
     }
 }
 
+// ggml_compute_forward_qsa_mask
+
+// reference for ggml_qsa_mask: per query row, the cells kq_mask keeps compete with value score[cell_blk[j]] + kq_mask[j];
+// the `width` largest (ties in ascending cell index) keep their kq_mask value, every other cell becomes -INFINITY
+template <typename T>
+static void ggml_compute_forward_qsa_mask_impl(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * score    = dst->src[0];
+    const ggml_tensor * cell_blk = dst->src[1];
+    const ggml_tensor * kq_mask  = dst->src[2];
+
+    const int64_t width    = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_kv     = kq_mask->ne[0];
+    const int64_t n_tps    = kq_mask->ne[1];
+    const int64_t n_stream = kq_mask->ne[3];
+    const int64_t n_blocks = score->ne[0];
+
+    std::vector<float>   val;
+    std::vector<float>   tmp;
+
+    for (int64_t ir = params->ith; ir < n_tps*n_stream; ir += params->nth) {
+        const int64_t t = ir % n_tps;
+        const int64_t s = ir / n_tps;
+
+        const float   * srow = (const float   *) ((const char *) score->data    + t*score->nb[1]   + s*score->nb[2]);
+        const int32_t * cb   = (const int32_t *) ((const char *) cell_blk->data + s*cell_blk->nb[1]);
+        const T       * mrow = (const T       *) ((const char *) kq_mask->data  + t*kq_mask->nb[1] + s*kq_mask->nb[3]);
+        T             * drow = (T             *) ((char       *) dst->data      + t*dst->nb[1]     + s*dst->nb[3]);
+
+        val.resize(n_kv);
+        tmp.clear();
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const float m = type_conversion_table<T>::to_f32(mrow[j]);
+            if (m == -INFINITY) {
+                val[j] = NAN; // does not compete
+                continue;
+            }
+            const int32_t b = cb[j];
+            GGML_ASSERT(b >= 0 && b < n_blocks);
+            val[j] = srow[b] + m;
+            tmp.push_back(val[j]);
+        }
+
+        if ((int64_t) tmp.size() <= width) {
+            for (int64_t j = 0; j < n_kv; ++j) {
+                drow[j] = mrow[j];
+            }
+            continue;
+        }
+
+        // the width-th largest value, how many cells beat it, and so how many at it are taken (ascending index)
+        std::nth_element(tmp.begin(), tmp.begin() + (width - 1), tmp.end(), std::greater<float>());
+        const float thr = tmp[width - 1];
+        int64_t n_gt = 0;
+        for (const float v : tmp) {
+            n_gt += v > thr;
+        }
+        int64_t n_eq = width - n_gt;
+
+        const T drop = type_conversion_table<T>::from_f32(-INFINITY);
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const float v = val[j];
+            bool keep = false;
+            if (v == v) {
+                if (v > thr) {
+                    keep = true;
+                } else if (v == thr && n_eq > 0) {
+                    keep = true;
+                    n_eq--;
+                }
+            }
+            drow[j] = keep ? mrow[j] : drop;
+        }
+    }
+}
+
+void ggml_compute_forward_qsa_mask(const ggml_compute_params * params, ggml_tensor * dst) {
+    switch (dst->type) {
+        case GGML_TYPE_F16: ggml_compute_forward_qsa_mask_impl<ggml_fp16_t>(params, dst); break;
+        case GGML_TYPE_F32: ggml_compute_forward_qsa_mask_impl<float>(params, dst); break;
+        default: GGML_ABORT("qsa_mask: unsupported type");
+    }
+}
+
 // ggml_compute_forward_top_k
 
 struct cmp_top_k {

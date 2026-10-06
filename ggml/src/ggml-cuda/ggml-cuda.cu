@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/qsa-mask.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -3107,6 +3108,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_TOP_K:
             ggml_cuda_op_top_k(ctx, dst);
             break;
+        case GGML_OP_QSA_MASK:
+            ggml_cuda_op_qsa_mask(ctx, dst);
+            break;
         case GGML_OP_ARGSORT:
             ggml_cuda_op_argsort(ctx, dst);
             break;
@@ -4433,6 +4437,20 @@ static bool ggml_cuda_match_qsa_score(const ggml_cgraph * cgraph, int i, ggml_cu
     const ggml_tensor * badd = next(GGML_OP_ADD, acc, 1);
     if (!badd || badd->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(badd->src[1]) || !ggml_are_same_shape(badd, badd->src[1])) {
         return false;
+    }
+
+    // the block scores alone (the caller selects from them, GGML_OP_QSA_MASK): stop at the bias add
+    if (j + 1 >= cgraph->n_nodes || cgraph->nodes[j + 1]->op != GGML_OP_PERMUTE) {
+        if (!ggml_is_contiguous(badd) || badd->type != GGML_TYPE_F32 || ggml_nelements(badd) != keys->ne[1]) {
+            return false;
+        }
+        m.n_nodes  = j - i + 1;
+        m.n_head   = n_head;
+        m.keys     = keys;
+        m.q        = q;
+        m.bias     = badd->src[1];
+        m.dst      = const_cast<ggml_tensor *>(badd);
+        return true;
     }
     const ggml_tensor * p1 = next(GGML_OP_PERMUTE, badd, 1);
     const ggml_tensor * c1 = p1 ? next(GGML_OP_CONT, p1, 1) : nullptr;
@@ -7070,6 +7088,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_QSA_MASK:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 &&
+                (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) && op->ne[1]*op->ne[3] <= 65535 &&
+                op->src[0]->ne[0] <= INT32_MAX && op->ne[0] <= INT32_MAX;
         case GGML_OP_TOP_K:
 #if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
             return true;

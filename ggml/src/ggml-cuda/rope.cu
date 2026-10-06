@@ -1288,7 +1288,12 @@ void ggml_cuda_op_qsa_score(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const int n_blocks = (int) keys->ne[1];
     const int n_kv     = (int) dst->ne[0];
 
-    ggml_cuda_pool_alloc<float> score(ctx.pool(), n_blocks);
+    // no cells: dst takes the block scores themselves
+    const bool blocks_only = cell_blk == nullptr;
+
+    ggml_cuda_pool_alloc<float> score_tmp(ctx.pool(), blocks_only ? 1 : n_blocks);
+    float * score_ptr = blocks_only ? (float *) dst->data : score_tmp.get();
+    struct { float * p; float * get() const { return p; } } score = { score_ptr };
     cudaStream_t stream = ctx.stream();
 
     const int64_t s_key = keys->nb[1]/sizeof(float);
@@ -1301,6 +1306,11 @@ void ggml_cuda_op_qsa_score(ggml_backend_cuda_context & ctx, const ggml_tensor *
         case 4: qsa_score_blocks_f32<4><<<grid_b, 256, 0, stream>>>((const float *) keys->data, (const float *) q->data, (const float *) bias->data, score.get(), n_blocks, s_key, s_q); break;
         case 8: qsa_score_blocks_f32<8><<<grid_b, 256, 0, stream>>>((const float *) keys->data, (const float *) q->data, (const float *) bias->data, score.get(), n_blocks, s_key, s_q); break;
         default: GGML_ABORT("qsa_score: unsupported head count");
+    }
+
+    if (blocks_only) {
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
 
     const dim3 grid_c((n_kv + 255)/256, 1, 1);

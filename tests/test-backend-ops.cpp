@@ -2824,6 +2824,87 @@ struct test_rms_norm_mul_rope : public test_case {
 };
 
 // qwen4exp QSA indexer key pooling: GET_ROWS -> row views summed -> SCALE -> RMS_NORM -> MUL -> ROPE (multi)
+// GGML_OP_QSA_MASK: the QSA attention mask from block scores; exact (every -inf in the same place)
+struct test_qsa_mask : public test_case {
+    const ggml_type type;
+    const int64_t n_kv;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const int width;
+    const int ties;     // 0: distinct scores, 1: few distinct values, 2: all equal
+    const float p_vis;  // share of cells the mask keeps
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, n_kv, n_tps, n_stream, width, ties, p_vis);
+    }
+
+    double max_err() override { return 0.0; }
+
+    test_qsa_mask(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 4096, int64_t n_tps = 3, int64_t n_stream = 1,
+            int width = 2051, int ties = 1, float p_vis = 0.9f)
+        : type(type), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), ties(ties), p_vis(p_vis) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_blocks = n_kv/4 + 1;
+        ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
+        ggml_set_name(score, "score");
+        ggml_tensor * cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
+        ggml_set_name(cell_blk, "cell_blk");
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, type, n_kv, n_tps, 1, n_stream);
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * out = ggml_qsa_mask(ctx, score, cell_blk, mask, width);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234 + n_kv + 7*ties);
+        const int64_t n_blocks = n_kv/4 + 1;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "score") == 0) {
+                std::vector<float> v(ggml_nelements(t));
+                std::uniform_real_distribution<float> u(0.0f, 50.0f);
+                for (size_t i = 0; i < v.size(); ++i) {
+                    float x = ties == 0 ? u(rng) : ties == 1 ? (float) (rng() % 6) : 0.0f;
+                    const uint32_t c = rng() % 100;
+                    if (c < 5) {
+                        x = -INFINITY;          // a foreign or unused block
+                    } else if (c < 7) {
+                        x = 1e9f + x;           // a tail block
+                    } else if (c < 8 && ties) {
+                        x = -0.0f;              // the ReLU of a negative sum
+                    }
+                    v[i] = x;
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "cell_blk") == 0) {
+                // mostly a cache layout (4 cells per block), with some cells in other blocks and in the spare block
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (size_t i = 0; i < v.size(); ++i) {
+                    const int64_t j = (int64_t) (i % n_kv);
+                    const uint32_t c = rng() % 100;
+                    v[i] = c < 3 ? (int32_t) (n_blocks - 1) : c < 6 ? (int32_t) (rng() % n_blocks) : (int32_t) (j/4);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "mask") == 0) {
+                std::vector<float> f(ggml_nelements(t));
+                std::uniform_real_distribution<float> u(0.0f, 1.0f);
+                for (float & x : f) {
+                    x = u(rng) < p_vis ? 0.0f : -INFINITY;
+                }
+                if (t->type == GGML_TYPE_F16) {
+                    std::vector<ggml_fp16_t> h(f.size());
+                    ggml_fp32_to_fp16_row(f.data(), h.data(), (int64_t) f.size());
+                    ggml_backend_tensor_set(t, h.data(), 0, ggml_nbytes(t));
+                } else {
+                    ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
+                }
+            }
+        }
+    }
+};
+
 struct test_qsa_pool : public test_case {
     const ggml_type type;
     const int64_t n_kv;
@@ -10105,6 +10186,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_qsa_pool(type, n_kv, 4, 1, GGML_ROPE_TYPE_IMROPE));
         }
         test_cases.emplace_back(new test_qsa_pool(type, 512, 4, 2, GGML_ROPE_TYPE_IMROPE));
+        for (int ties : {0, 1, 2}) {
+            test_cases.emplace_back(new test_qsa_mask(type, 4096, 3, 1, 2051, ties, 0.9f));
+            test_cases.emplace_back(new test_qsa_mask(type, 61440, 1, 1, 2051, ties, 0.9f));
+            test_cases.emplace_back(new test_qsa_mask(type, 9000, 70, 2, 2051, ties, 0.5f));
+        }
+        test_cases.emplace_back(new test_qsa_mask(type, 1500, 4, 1, 2051, 1, 1.0f));     // keeps every visible cell
+        test_cases.emplace_back(new test_qsa_mask(type, 262144, 2, 1, 2051, 1, 0.3f));
+        test_cases.emplace_back(new test_qsa_mask(type, 4096, 1024, 1, 2051, 1, 0.7f));  // a prefill ubatch
         test_cases.emplace_back(new test_qsa_pool(type, 512, 2, 1, GGML_ROPE_TYPE_MROPE));
     }
 

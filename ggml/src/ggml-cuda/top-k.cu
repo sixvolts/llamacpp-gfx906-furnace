@@ -306,6 +306,20 @@ static void top_k_radix_cuda(
 
 #endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
 
+#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+// the HIP top-k of ggml_cuda_op_top_k for contiguous rows (GGML_OP_QSA_MASK's reference mode compares against it)
+void ggml_cuda_top_k_rows_f32(ggml_cuda_pool & pool, const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+    if (ncols > 1024) {
+        top_k_radix_cuda(pool, src, dst, ncols, nrows, k, stream);
+    } else {
+        ggml_cuda_pool_alloc<int> tmp(pool, (size_t) ncols * nrows);
+        argsort_f32_i32_cuda_bitonic(src, tmp.get(), ncols, nrows, GGML_SORT_ORDER_DESC, stream);
+        CUDA_CHECK(cudaMemcpy2DAsync(dst, k * sizeof(int), tmp.get(), ncols * sizeof(int), k * sizeof(int), nrows,
+                                     cudaMemcpyDeviceToDevice, stream));
+    }
+}
+#endif
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;

@@ -2419,6 +2419,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         // dense self-attention restricted to the cells that top_k names
+        // is_mask: top_k is already the attention mask of the selection (build_qsa_top_k's GGML_OP_QSA_MASK path)
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
@@ -2426,20 +2427,23 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * v_cur,
                     ggml_tensor * top_k,
                           float   kq_scale,
-                            int   il);
+                            int   il,
+                           bool   is_mask = false);
 
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
+        // *is_mask set: the result is the attention mask of the selection instead (see build_attn_qsa)
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il);
+                            int   il,
+                           bool * is_mask = nullptr);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

@@ -733,13 +733,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
-        mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool scores) :
+        mctx(mctx), ratio(ratio), blk_bias(blk_bias), scores(scores) {}
     virtual ~llm_graph_input_qsa() = default;
+
+    // the indexer scores the cells only when the window holds more than the top-k budget: with fewer, the top-k keeps
+    // every cell and the attention mask is the KQ mask itself (GGML_OP_QSA_MASK path only)
+    static bool need_scores(int64_t n_kv, uint32_t ratio, uint32_t top_k, bool mask_op) {
+        static const bool always = getenv("LLAMA_QSA_ALWAYS_SCORE") != nullptr;
+        return always || !mask_op || n_kv > (int64_t) top_k + ratio - 1;
+    }
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        if (scores) {
+            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -759,6 +768,14 @@ public:
         res &= params.ubatch.n_tokens % n_stream == 0;
 
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
+
+        if (scores != need_scores(n_kv, ratio, top_k, mask_op)) {
+            return false;
+        }
+        if (!scores) {
+            return res;
+        }
+
         res &= cell_blk->ne[0]  == n_kv;
         res &= cell_blk->ne[1]  == n_stream;
         res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
@@ -781,6 +798,11 @@ public:
 
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
+
+    // see need_scores; top_k and mask_op are what the graph was built with
+    const bool scores;
+    uint32_t   top_k   = 0;
+    bool       mask_op = false;
 };
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -789,7 +811,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_tensor *                           inp_pos,
         ggml_tensor *                           kq_mask,
         int *                                   sections,
-        int                                     il) {
+        int                                     il,
+        bool *                                  is_mask) {
+    if (is_mask) {
+        *is_mask = false;
+    }
+
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
     const int64_t idx_dim  = hparams.indexer_head_size;
@@ -814,6 +841,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
 
+    // GGML_OP_QSA_MASK builds the attention mask straight from the block scores (no per-cell expansion, top-k and
+    // mask rebuild); it needs the per-block bias and a caller that takes the mask. LLAMA_QSA_MASK=0 restores the old path
+    static const bool mask_op_env = getenv("LLAMA_QSA_MASK") == nullptr || atoi(getenv("LLAMA_QSA_MASK")) != 0;
+    const bool mask_op = mask_op_env && blk_bias && is_mask != nullptr;
+
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
 
@@ -821,18 +853,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (it != qsa_inps.end()) {
         inp = it->second;
     } else {
-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
+        const bool scores = llm_graph_input_qsa::need_scores(n_kv, (uint32_t) r, hparams.indexer_top_k, mask_op);
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, scores);
+        qsa->top_k   = hparams.indexer_top_k;
+        qsa->mask_op = mask_op;
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
-        qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        if (scores) {
+            qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+            qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+            qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
+            qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
-        ggml_set_input(qsa->cell_blk);
-        ggml_set_input(qsa->blk_cells);
-        ggml_set_input(qsa->blk_pos);
-        ggml_set_input(qsa->bias);
+            ggml_set_input(qsa->cell_blk);
+            ggml_set_input(qsa->blk_cells);
+            ggml_set_input(qsa->blk_pos);
+            ggml_set_input(qsa->bias);
+        }
 
         inp = qsa.get();
         res->add_input(std::move(qsa));
@@ -845,6 +882,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     cb(k_raw, "indexer_k_raw", il);
 
     ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il));
+
+    // the whole window fits the budget: the keys still go into the cache (a later, wider window pools them), and the
+    // attention mask is the KQ mask (the top-k would keep every cell, and the rebuilt mask equals the KQ mask)
+    if (!inp->scores) {
+        *is_mask = true;
+        return kq_mask;
+    }
 
     // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
@@ -911,6 +955,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         score = ggml_add(ctx0, score, inp->bias);
     }
 
+    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+
+    if (mask_op) {
+        ggml_tensor * mask = ggml_qsa_mask(ctx0, score, inp->cell_blk, kq_mask, (int) width);
+        cb(mask, "indexer_qsa_mask", il);
+        *is_mask = true;
+        return mask;
+    }
+
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
     ggml_tensor * expanded = ggml_get_rows(ctx0,
             ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
@@ -924,9 +978,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         expanded = ggml_add(ctx0, expanded, inp->bias);
     }
     cb(expanded, "indexer_score_tokens", il);
-
-    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
-    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
 
@@ -946,7 +997,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor *             v_cur,
         ggml_tensor *             top_k,
         float                     kq_scale,
-        int                       il) {
+        int                       il,
+        bool                      is_mask) {
     // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
     // has already scored with its own query in build_qsa_top_k, so top_k is unaffected.
     if (inp->self_k_rot) {
@@ -977,6 +1029,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
+
+    // the selection's mask came straight from GGML_OP_QSA_MASK (or is the KQ mask when the window fits the budget)
+    if (is_mask) {
+        const int64_t r     = hparams.dsv4_compress_ratios[il];
+        const int64_t width = std::min<int64_t>(kq_mask->ne[0], (int64_t) hparams.indexer_top_k + r - 1);
+
+        ggml_tensor * cur = build_attn_mha(q_cur, mctx_cur->get_k(ctx0, il), mctx_cur->get_v(ctx0, il), nullptr, top_k,
+                nullptr, nullptr, width, kq_scale, il);
+        cb(cur, "kqv_out", il);
+
+        if (inp->self_v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        }
+
+        return cur;
+    }
 
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
@@ -1032,7 +1100,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
-    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
+    bool qsa_mask = false;
+    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, &qsa_mask) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
@@ -1085,7 +1154,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
     if (top_k) {
-        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, kq_scale, il);
+        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, kq_scale, il, qsa_mask);
     } else {
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
