@@ -435,6 +435,17 @@ public:
         return -1;
     }
 
+    // append the cells of sequence seq_id with positions in [p0, p1) (p0 < 0: from the start, p1 < 0: to the end)
+    void seq_cells_in(llama_seq_id seq_id, llama_pos p0, llama_pos p1, std::vector<uint32_t> & out) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+
+        const auto & sp = seq_pos[seq_id];
+        const llama_pos e = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+        for (auto it = sp.lower_bound({ std::max<llama_pos>(p0, 0), 0u }); it != sp.end() && it->first < e; ++it) {
+            out.push_back(it->second);
+        }
+    }
+
     // the longest run of empty cells: [start, start + len)
     void free_run_max(uint32_t & start, uint32_t & len) const {
         start = 0;

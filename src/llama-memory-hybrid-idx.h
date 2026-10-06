@@ -3,6 +3,8 @@
 #include "llama-memory-hybrid.h"
 #include "llama-kv-cells.h"
 
+#include "ggml-cpp.h"
+
 #include <map>
 #include <memory>
 #include <vector>
@@ -86,14 +88,40 @@ public:
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
     // cell j of all of these is cell lo + j of the cache, the start of the KV window (llama_kv_cache::get_kv_window)
+    // bias may be nullptr (and the tensors host scratch without a buffer): only the layout is brought up to date
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias, uint32_t lo) const;
+
+    // QSA block-key cache: per QSA layer, the finished (pooled, normed, roped) indexer key of every numbered block of
+    // the cached layout, F32 [idx_dim, kv_size/ratio + 1] (the last row takes padding writes). A decode step then
+    // re-pools only the blocks that are new or whose cells were rewritten, and scores against the cache.
+    // Unified caches only; LLAMA_QSA_BLK_CACHE=0 disables it. nullptr when off
+    ggml_tensor * get_qsa_blk_k(int32_t il) const;
+
+    struct qsa_blk_plan {
+        int     mode = 0;            // 0: pool every block, no cache; 1: pool every block and refresh the cache;
+                                     // 2: pool `bids` only (padded to n_re) and score against the cache
+        int32_t n_re = 0;            // re-pooled block slots of the graph (fixed by the ubatch shape)
+        int     kind = 0;            // the layout the block ids belong to (see qsa_last_kind)
+        uint64_t gen = 0;
+        std::vector<int32_t> bids;   // mode 2: the blocks to re-pool
+    };
+
+    // bring the layout of each QSA ratio up to date for this ubatch and decide how its block keys are computed
+    // called when the ubatch is applied, before the graph is built or reused (the graph's shape follows the plan)
+    void qsa_prepare(const llama_ubatch & ubatch, uint32_t lo, int64_t n_kv, std::map<uint32_t, qsa_blk_plan> & plans) const;
+
+    // mode 2 inputs: re_cells I32 [ratio*n_re] members, re_pos I32 [4*n_re] rope rows, re_ids I64 [n_re] cache rows
+    void set_input_qsa_re(ggml_tensor * re_cells, ggml_tensor * re_pos, ggml_tensor * re_ids, uint32_t ratio,
+                          const qsa_blk_plan & plan) const;
 
     // the set_input_qsa layout of one stream holding one sequence, kept between calls: decoding only fills
     // empty cells, so the next call updates the few cells that changed instead of regrouping every cell
     struct qsa_layout {
         bool                  valid    = false;
+        uint64_t              gen      = 0;    // bumped by every full rebuild: block ids are only stable within one
+        std::vector<int32_t>  dirty;           // numbered blocks whose cells were rewritten in place (seq_rm + re-add)
         const void          * cells    = nullptr;
         uint32_t              lo       = 0;
         llama_kv_cells::seq_set_t vis;   // sequences of the ubatch: the cells of others read as empty
@@ -119,6 +147,8 @@ public:
     // are per block and the top-k runs per cell
     struct qsa_layout_ms {
         bool                  valid    = false;
+        uint64_t              gen      = 0;    // bumped by every full rebuild: block ids are only stable within one
+        std::vector<int32_t>  dirty;           // numbered blocks whose cells were rewritten in place (seq_rm + re-add)
         const void          * cells    = nullptr;
         uint32_t              lo       = 0;
         llama_kv_cells::seq_set_t vis;
@@ -147,6 +177,34 @@ public:
 private:
     mutable std::map<uint32_t, qsa_layout>    qsa_layouts;
     mutable std::map<uint32_t, qsa_layout_ms> qsa_layouts_ms;
+
+    // drop every cached layout (block ids restart, so the block keys are recomputed)
+    void qsa_layouts_drop();
+
+    mutable uint64_t qsa_gen_next = 1;
+
+    // cells seq_rm emptied since the layouts were last brought up to date (absolute indices of the indexer cache).
+    // a cell filled again at the same position keeps its block, which then needs its key re-pooled
+    mutable std::vector<uint32_t> qsa_rm_cells;
+
+    // block-key cache
+    std::map<int32_t, ggml_tensor *> qsa_blk_k;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_blk_bufs;
+    std::vector<uint32_t> qsa_ratios;   // distinct ratios of the QSA layers
+
+    // the layout set_input_qsa last used for a ratio (one stream): 1 qsa_layouts, 2 qsa_layouts_ms, 0 none it can keep
+    mutable std::map<uint32_t, int> qsa_last_kind;
+
+    // qsa_prepare brought this ratio's layout up to date for the current ubatch: the ubatch's own set_input_qsa takes
+    // it as it is instead of scanning the cells again
+    mutable std::map<uint32_t, bool> qsa_fresh;
+
+    struct qsa_key_state {
+        bool     valid   = false;
+        uint64_t gen     = 0;   // layout generation the keys belong to
+        int32_t  n_keyed = 0;   // blocks [0, n_keyed) hold current keys
+    };
+    mutable std::map<uint32_t, qsa_key_state> qsa_keys;
 
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -205,7 +263,19 @@ public:
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
 
+    const llama_memory_hybrid_idx * get_mem() const { return mem; }
+
+    // the block-key plan of the current ubatch for a ratio (see llama_memory_hybrid_idx::qsa_prepare), nullptr if none
+    const llama_memory_hybrid_idx::qsa_blk_plan * get_qsa_plan(uint32_t ratio) const;
+
+    void set_input_qsa_re(ggml_tensor * re_cells, ggml_tensor * re_pos, ggml_tensor * re_ids, uint32_t ratio) const;
+
 private:
+    std::map<uint32_t, llama_memory_hybrid_idx::qsa_blk_plan> qsa_plans;
+
+    // made from a batch (has ubatches): only then does apply() plan the block keys
+    bool is_batch = false;
+
     const llama_memory_hybrid_idx * mem = nullptr;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them

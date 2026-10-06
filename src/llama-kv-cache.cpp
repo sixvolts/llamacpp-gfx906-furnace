@@ -1144,6 +1144,13 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot_window(const llama_ubatch & 
     if (n_fresh > 0) {
         cells.free_run_max(run0, run_len);
 
+        // a run that starts right after another sequence's cells: leave that sequence room to grow, or its next
+        // tokens land among the new sequence's (and once speculative drafts are dropped, in each other's freed cells)
+        static const uint32_t headroom_max = getenv("LLAMA_KV_SEQ_HEADROOM") ? (uint32_t) atoi(getenv("LLAMA_KV_SEQ_HEADROOM")) : 4096;
+        const uint32_t headroom = run0 > 0 ? std::min(headroom_max, run_len/2) : 0;
+        run0    += headroom;
+        run_len -= headroom;
+
         uint32_t k = 0;
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
             const llama_seq_id seq_id = ubatch.seq_id_unq[s];
