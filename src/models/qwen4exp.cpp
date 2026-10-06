@@ -420,6 +420,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
     if (mctx_idx) {
         GGML_ASSERT(mctx_idx->get_n_kv() == inp->mctx->get_attn()->get_n_kv() &&
+                mctx_idx->get_kv_lo() == inp->mctx->get_attn()->get_kv_lo() &&
                 "the indexer cache must track the attention cache cell for cell");
     }
 

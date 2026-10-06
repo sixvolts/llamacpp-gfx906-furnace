@@ -66,7 +66,15 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    // several sequences in one unified cache: attend only the span of the cells of the ubatch's sequences
+    // the indexer mirrors the attention cells, so both caches find the same window
+    get_mem_attn()->set_window(true);
+    if (mem_idx) {
+        mem_idx->set_window(true);
+        GGML_ASSERT(mem_idx->get_window() == get_mem_attn()->get_window());
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -295,12 +303,57 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
 }
 
+// the cells [lo, lo + n_kv) a ubatch attends, numbered from lo. the cells of sequences outside the ubatch
+// read as empty: every token masks them anyway, and inside a window their positions need not fit it
+struct qsa_cells {
+    const llama_kv_cells &          cells;
+    const uint32_t                  lo;
+    const llama_kv_cells::seq_set_t vis;
+
+    bool is_empty(int64_t j) const {
+        return cells.is_empty(lo + j) || (cells.seq_get_all(lo + j) & vis).none();
+    }
+
+    llama_pos pos_get(int64_t j) const {
+        return cells.pos_get(lo + j);
+    }
+
+    const llama_kv_cell_ext & ext_get(int64_t j) const {
+        return cells.ext_get(lo + j);
+    }
+
+    const llama_kv_cells::seq_set_t & seq_get_all(int64_t j) const {
+        return cells.seq_get_all(lo + j);
+    }
+
+    bool seq_has(int64_t j, llama_seq_id seq_id) const {
+        return cells.seq_has(lo + j, seq_id);
+    }
+
+    // over the whole cache, not the window
+    llama_pos seq_pos_min(llama_seq_id seq_id) const {
+        return cells.seq_pos_min(seq_id);
+    }
+
+    template <typename L>
+    bool same(const L & lay) const {
+        return lay.cells == (const void *) &cells && lay.lo == lo && lay.vis == vis;
+    }
+
+    template <typename L>
+    void stamp(L & lay) const {
+        lay.cells = (const void *) &cells;
+        lay.lo    = lo;
+        lay.vis   = vis;
+    }
+};
+
 // bring a layout up to date when the only change since it was built is newly filled cells, and every
 // block they complete lies past the numbered ones. anything else (moved or dropped cells, a repeated
 // position, a block completing out of order) returns false and leaves the layout for a full rebuild
-static bool qsa_layout_advance(llama_memory_hybrid_idx::qsa_layout & L, const llama_kv_cells & cells,
+static bool qsa_layout_advance(llama_memory_hybrid_idx::qsa_layout & L, const qsa_cells & cells,
         int64_t n_kv, int64_t n_blocks, int64_t r) {
-    if (!L.valid || L.cells != (const void *) &cells || L.n_kv != n_kv || L.n_blocks != n_blocks || L.ratio != r) {
+    if (!L.valid || !cells.same(L) || L.n_kv != n_kv || L.n_blocks != n_blocks || L.ratio != r) {
         return false;
     }
 
@@ -390,9 +443,9 @@ static bool qsa_layout_ms_disabled() {
 // bring a multi-sequence layout up to date with the cells: new cells join or open (bucket, sequence set)
 // groups and a group that fills becomes the next numbered block. returns false when the change is not
 // an append (a cell emptied, moved, doubled a slot, or the window changed), so the caller rebuilds
-static bool qsa_layout_ms_advance(llama_memory_hybrid_idx::qsa_layout_ms & L, const llama_kv_cells & cells,
+static bool qsa_layout_ms_advance(llama_memory_hybrid_idx::qsa_layout_ms & L, const qsa_cells & cells,
         int64_t n_kv, int64_t n_blocks, int64_t r) {
-    if (!L.valid || L.cells != (const void *) &cells || L.n_kv != n_kv || L.n_blocks != n_blocks || L.ratio != r) {
+    if (!L.valid || !cells.same(L) || L.n_kv != n_kv || L.n_blocks != n_blocks || L.ratio != r) {
         return false;
     }
 
@@ -504,7 +557,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        uint32_t lo) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
@@ -548,10 +602,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
     std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0);
 
+    // a window covers one stream
+    GGML_ASSERT(lo == 0 || n_ns == 1);
+
+    llama_kv_cells::seq_set_t vis;
+    for (uint32_t i = 0; i < ubatch->n_seqs_unq; ++i) {
+        vis.set(ubatch->seq_id_unq[i]);
+    }
+
     for (int64_t s = 0; s < n_ns; ++s) {
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
-        const auto & cells = get_mem_idx()->get_cells(seq_of_stream);
+        const qsa_cells cells = { get_mem_idx()->get_cells(seq_of_stream), lo, vis };
 
         int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
@@ -827,7 +889,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
             if (lay != nullptr) {
                 lay->valid = !ranked && !oor;
                 if (lay->valid) {
-                    lay->cells    = (const void *) &cells;
+                    cells.stamp(*lay);
                     lay->n_kv     = n_kv;
                     lay->n_blocks = n_blocks;
                     lay->ratio    = r;
@@ -892,7 +954,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 auto & L = *lay_ms;
                 L.valid = !ranked && !oor && !dup;
                 if (L.valid) {
-                    L.cells    = (const void *) &cells;
+                    cells.stamp(L);
                     L.n_kv     = n_kv;
                     L.n_blocks = n_blocks;
                     L.ratio    = r;
@@ -1097,5 +1159,5 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         bool blk_bias) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, get_idx()->get_kv_lo());
 }

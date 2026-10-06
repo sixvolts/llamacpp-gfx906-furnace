@@ -85,15 +85,18 @@ public:
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
+    // cell j of all of these is cell lo + j of the cache, the start of the KV window (llama_kv_cache::get_kv_window)
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, uint32_t lo) const;
 
     // the set_input_qsa layout of one stream holding one sequence, kept between calls: decoding only fills
     // empty cells, so the next call updates the few cells that changed instead of regrouping every cell
     struct qsa_layout {
         bool                  valid    = false;
         const void          * cells    = nullptr;
+        uint32_t              lo       = 0;
+        llama_kv_cells::seq_set_t vis;   // sequences of the ubatch: the cells of others read as empty
         int64_t               n_kv     = 0;
         int64_t               n_blocks = 0;
         int64_t               ratio    = 0;
@@ -117,6 +120,8 @@ public:
     struct qsa_layout_ms {
         bool                  valid    = false;
         const void          * cells    = nullptr;
+        uint32_t              lo       = 0;
+        llama_kv_cells::seq_set_t vis;
         int64_t               n_kv     = 0;
         int64_t               n_blocks = 0;
         int64_t               ratio    = 0;
