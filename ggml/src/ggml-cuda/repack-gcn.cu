@@ -73,10 +73,34 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
         return false;
     }
     switch (t->type) {
-        case GGML_TYPE_Q3_K:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K: return t->ne[0] % 256 == 0;
+        case GGML_TYPE_Q3_K: {
+            static const bool enabled = [] {
+                const char * e = getenv("GGML_CUDA_REPACK_Q3_K");
+                return e == nullptr || e[0] != '0';
+            }();
+            return enabled && t->ne[0] % 256 == 0;
+        }
+        case GGML_TYPE_Q4_K: {
+            static const bool enabled = [] {
+                const char * e = getenv("GGML_CUDA_REPACK_Q4_K");
+                return e == nullptr || e[0] != '0';
+            }();
+            return enabled && t->ne[0] % 256 == 0;
+        }
+        case GGML_TYPE_Q5_K: {
+            static const bool enabled = [] {
+                const char * e = getenv("GGML_CUDA_REPACK_Q5_K");
+                return e == nullptr || e[0] != '0';
+            }();
+            return enabled && t->ne[0] % 256 == 0;
+        }
+        case GGML_TYPE_Q6_K: {
+            static const bool enabled = [] {
+                const char * e = getenv("GGML_CUDA_REPACK_Q6_K");
+                return e == nullptr || e[0] != '0';
+            }();
+            return enabled && t->ne[0] % 256 == 0;
+        }
         case GGML_TYPE_Q8_0: {
             // Q8_0 repack is its own opt-in: the repacked MMQ wins
             // prefill big (+43% on a pure-Q8_0 0.8B) but the repacked
