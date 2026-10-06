@@ -1667,6 +1667,27 @@ private:
             }
         }
 
+        // idle slots stay resident (--no-cache-idle-slots): evict before the task starts until the pool holds all of
+        // its prompt. evicting when a decode runs out of cells instead leaves the sequence split between the space
+        // that was free and the space the eviction opened, and its KV window then spans the pool in between
+        if (ret && !params_base.cache_idle_slots && params_base.kv_unified && task.type == SERVER_TASK_TYPE_COMPLETION) {
+            const int64_t n_ctx_pool = llama_n_ctx(ctx_tgt);
+            const int64_t n_need     = (int64_t) task.tokens.size() + 2*(int64_t) llama_n_ubatch(ctx_tgt);
+
+            const auto n_free = [&]() {
+                int64_t n_used = 0;
+                for (const auto & slot : slots) {
+                    if (&slot != ret) {
+                        n_used += slot.prompt.n_tokens();
+                    }
+                }
+                return n_ctx_pool - n_used;
+            };
+
+            while (n_free() < n_need && try_clear_idle_slots(ret)) {
+            }
+        }
+
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
@@ -1698,28 +1719,38 @@ private:
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
-    bool try_clear_idle_slots() {
+    // keep: a slot that must not be evicted (the one a task is about to take)
+    bool try_clear_idle_slots(const server_slot * keep = nullptr) {
         bool res = false;
 
         if (!params_base.kv_unified) {
             return res;
         }
 
+        // evict the least recently used idle slot, one per call. With --no-cache-idle-slots this is the only place idle
+        // conversations leave VRAM, so it saves the slot (state and checkpoints) to the prompt cache first: a returning
+        // conversation is then loaded from host RAM instead of prefilled again.
+        server_slot * victim = nullptr;
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0 || &slot == keep) {
                 continue;
             }
-
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
-
-                slot.prompt_clear();
-
-                res = true;
-
-                // clear slots one by one
-                break;
+            if (victim == nullptr || slot.t_last_used < victim->t_last_used) {
+                victim = &slot;
             }
+        }
+
+        if (victim != nullptr) {
+            SRV_WRN("evicting idle slot %d with %zu tokens%s\n", victim->id, victim->prompt.tokens.size(),
+                    prompt_cache ? " to the prompt cache" : "");
+
+            if (prompt_cache && victim->prompt_save(*prompt_cache)) {
+                prompt_cache->update();
+            }
+
+            victim->prompt_clear();
+
+            res = true;
         }
 
         return res;
