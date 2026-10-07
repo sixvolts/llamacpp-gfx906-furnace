@@ -9,6 +9,8 @@ int  ggml_cuda_try_conv_step_fusion(ggml_backend_cuda_context & ctx, const ggml_
 bool ggml_cuda_conv_state_gather_elidable(const ggml_cgraph * cgraph, const ggml_tensor * gr);
 // ggml_cuda_is_view_or_noop, exported for the fusion matchers
 bool ggml_cuda_is_view_or_noop_public(const ggml_tensor * t);
+// true: ggml_cuda_try_fuse does not fuse at this node (GGML_CUDA_DISABLE_FUSION, GGML_CUDA_FUSE_SKIP_OPS)
+bool ggml_cuda_fusion_off_at(const ggml_tensor * node);
 
 // graph_optimize: move the conv step's SSM_CONV -> SILU behind its CONCAT so the step fusion covers them
 void ggml_cuda_conv_step_graph_optimize(ggml_cgraph * cgraph);

@@ -3363,6 +3363,16 @@ bool ggml_cuda_is_view_or_noop_public(const ggml_tensor * t) {
     return ggml_cuda_is_view_or_noop(t);
 }
 
+bool ggml_cuda_fusion_off_at(const ggml_tensor * node) {
+    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    if (disable_fusion) {
+        return true;
+    }
+    // bisect: GGML_CUDA_FUSE_SKIP_OPS=",RMS_NORM,SILU," skips every fusion starting at those ops (ggml_op_desc names)
+    static const char * skip_ops = getenv("GGML_CUDA_FUSE_SKIP_OPS");
+    return skip_ops != nullptr && strstr(skip_ops, (std::string(",") + ggml_op_desc(node) + ",").c_str()) != nullptr;
+}
+
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
@@ -4545,12 +4555,11 @@ static int ggml_cuda_try_hc_post_norm(ggml_backend_cuda_context * cuda_ctx, ggml
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
-    static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (disable_fusion) {
+    ggml_tensor * node = cgraph->nodes[i];
+
+    if (ggml_cuda_fusion_off_at(node)) {
         return 0;
     }
-
-    ggml_tensor * node = cgraph->nodes[i];
 
     if (node->op == GGML_OP_CONCAT) {
         const int n = ggml_cuda_try_conv_step_fusion(*cuda_ctx, cgraph, i);

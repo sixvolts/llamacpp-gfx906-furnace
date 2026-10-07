@@ -390,8 +390,9 @@ bool ggml_cuda_conv_state_gather_elidable(const ggml_cgraph * cgraph, const ggml
     if (disabled || cgraph == nullptr) {
         return false;
     }
+    // the gather is skipped only for a step that will run fused: unfused, the CONCAT reads the gather's output
     const ggml_tensor * cat = conv_step_concat_of(cgraph, gr, nullptr, nullptr);
-    return cat != nullptr && conv_step_concat_ok(cat);
+    return cat != nullptr && conv_step_concat_ok(cat) && !ggml_cuda_fusion_off_at(cat);
 }
 
 int ggml_cuda_try_conv_step_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
