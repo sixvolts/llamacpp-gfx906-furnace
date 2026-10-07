@@ -4375,6 +4375,7 @@ struct ggml_cuda_qsa_score_match {
     const ggml_tensor * cell_blk = nullptr;
     const ggml_tensor * mask     = nullptr;
     ggml_tensor *       cpy      = nullptr;
+    int                 cpy_idx  = -1;
     ggml_tensor *       dst      = nullptr;
 };
 
@@ -4470,9 +4471,10 @@ static bool ggml_cuda_match_qsa_score(const ggml_cgraph * cgraph, int i, ggml_cu
         if (!cpy || cpy->type != GGML_TYPE_F32) {
             return false;
         }
-        mask  = cpy->src[0];
-        m.cpy = const_cast<ggml_tensor *>(cpy);
-        mrs   = next(GGML_OP_RESHAPE, cpy, 1);
+        mask      = cpy->src[0];
+        m.cpy     = const_cast<ggml_tensor *>(cpy);
+        m.cpy_idx = j;
+        mrs       = next(GGML_OP_RESHAPE, cpy, 1);
     } else {
         mrs  = next(GGML_OP_RESHAPE, nullptr, 1);
         mask = mrs ? mrs->src[0] : nullptr;
@@ -4575,10 +4577,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (!no_qsa_score && ggml_cuda_match_qsa_score(cgraph, i, m)) {
             const int out_idx = i + m.n_nodes - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, m.n_nodes, &out_idx, 1)) {
-                if (m.cpy != nullptr) {
+                // the cast is placed after MUL_MAT, when the keys and the query are already dead, so its
+                // buffer may sit on top of them: never run it ahead of the kernel that reads them.
+                // with no user besides the mask reshape it is not needed at all
+                const bool cpy_used = m.cpy != nullptr && ggml_node_get_use_count(cgraph, m.cpy_idx) > 1;
+                ggml_cuda_op_qsa_score(*cuda_ctx, m.keys, m.q, m.n_head, m.bias, m.cell_blk, m.mask, m.dst);
+                if (cpy_used) {
                     ggml_cuda_cpy(*cuda_ctx, m.cpy->src[0], m.cpy->src[1]);
                 }
-                ggml_cuda_op_qsa_score(*cuda_ctx, m.keys, m.q, m.n_head, m.bias, m.cell_blk, m.mask, m.dst);
                 return m.n_nodes - 1;
             }
         }
