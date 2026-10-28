@@ -2430,7 +2430,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tools({
                 run_in_terminal_tool
         })
-            .expect_content("Let me inspect the current directory.\n")
+            .expect_content("Let me inspect the current directory.")
             .expect_tool_calls({
                 { "run_in_terminal", R"({"command": "pwd"})", {} },
             })
@@ -2452,7 +2452,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 run_in_terminal_tool
         })
             .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
-            .expect_content("Let me inspect the current directory.\n")
+            .expect_content("Let me inspect the current directory.")
             .expect_tool_calls({
                 { "run_in_terminal", R"({"command": "pwd"})", {} },
             })
@@ -2561,7 +2561,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
                 .messages({ user_start, assistant_todos, tool_result, user_continue })
                 .expect_reasoning("I need to run a terminal command.")
-                .expect_content("Let me inspect the current directory.\n")
+                .expect_content("Let me inspect the current directory.")
                 .expect_tool_calls({
                     { "run_in_terminal", R"({"command": "pwd"})", {} },
                 })
