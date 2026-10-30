@@ -91,6 +91,10 @@ public:
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
         int32_t   tail = -1;
 
+        // largest rollback whose snapshot the last ubatch guarantees: a ubatch of n tokens writes the states
+        // after its last min(n, n_rs_seq + 1) tokens, so the state before the ubatch (rollback n) is never there
+        uint32_t rs_max = 0;
+
         std::set<llama_seq_id> seq_id;
 
         bool has_seq_id(const llama_seq_id & id) const {

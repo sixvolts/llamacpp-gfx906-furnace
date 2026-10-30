@@ -150,6 +150,7 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].seq_id.clear();
         cells[i].src = -1;
         cells[i].tail = -1;
+        cells[i].rs_max = 0;
     }
 
     head = 0;
@@ -196,7 +197,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
 
-            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            // partial rollback via per-token snapshot index (bounded by the snapshots of the last ubatch)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 // no layer, so only the position moves back
                 if (is_empty()) {
@@ -206,7 +207,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                if (!pending && rollback >= 1 && rollback <= (llama_pos) cell.rs_max) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -647,6 +648,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
+            std::swap(dst_cell.rs_max, src_cell.rs_max); // the graph's extra copy moves the snapshot planes too
 
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
@@ -674,6 +676,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
         cell.pos = last_pos;
+        cell.rs_max = std::min(n_seq_tokens - 1, n_rs_seq);
         cell.seq_id.clear();
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
@@ -1406,7 +1409,20 @@ void llama_memory_recurrent_context::set_input_s_copy(int32_t * data, uint32_t n
 
     // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
     for (uint32_t i = 0; i < n_rs; ++i) {
+        auto & cell = mem->cells[i + mem->head];
+
+        bool pending = false;
+        if (i >= n_seqs && mem->n_rs_seq > 0 && !cell.seq_id.empty()) {
+            const llama_seq_id seq = *cell.seq_id.begin();
+            pending = seq >= 0 && (size_t) seq < mem->rs_idx.size() && mem->rs_idx[seq] != 0;
+        }
+
         data[i] = s_copy(i);
+
+        // the plane-0 copy applies the pending rollback, planes 1.. still hold the snapshots of the old position
+        if (pending) {
+            cell.rs_max = 0;
+        }
     }
 
     for (uint32_t p = 1; p <= mem->n_rs_seq; ++p) {
