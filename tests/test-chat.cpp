@@ -2587,6 +2587,32 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 })
                 .run();
         }
+
+        // json_schema output after the think block (upstream tests this on LFM3, which this fork doesn't have)
+        const std::string answer_schema = R"({"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"]})";
+
+        tst.test("I'm\nthinking\n</think>\n\n{\"answer\":42}")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .json_schema(answer_schema)
+            .expect_reasoning("I'm\nthinking")
+            .expect_content(R"({"answer":42})")
+            .run();
+
+        // the reasoning block of the generation prompt must still be accepted when it is not extracted
+        tst.test("{\"answer\":42}")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .json_schema(answer_schema)
+            .expect_content(R"({"answer":42})")
+            .run();
+
+        tst.test("I'm\nthinking\n</think>\n\n{\"answer\":42}")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .json_schema(answer_schema)
+            .expect_content(R"({"answer":42})")
+            .run();
     }
 
     {
