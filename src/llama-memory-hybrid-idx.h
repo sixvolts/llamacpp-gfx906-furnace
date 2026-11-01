@@ -96,9 +96,10 @@ public:
     // QSA block-key cache: per QSA layer, the finished (pooled, normed, roped) indexer key of every numbered block of
     // the cached layout, F32 [idx_dim, kv_size/ratio + 1] (the last row takes padding writes). A decode step then
     // re-pools only the blocks that are new or whose cells were rewritten, and scores against the cache.
-    // One tensor per stream (a view into a shared one made the scheduler re-reserve the graph every ubatch);
-    // only a ubatch of one stream uses it. LLAMA_QSA_BLK_CACHE=0 disables it. nullptr when off
-    ggml_tensor * get_qsa_blk_k(int32_t il, uint32_t strm) const;
+    // One tensor per layer, F32 [idx_dim, kv_size/ratio + 1, n_stream]: every ubatch builds the same graph, whatever its
+    // streams, so one scheduler plan covers them all. A ubatch over several streams pools every block and writes the
+    // rows of each of its streams without trusting them (qsa_prepare). LLAMA_QSA_BLK_CACHE=0 disables it. nullptr when off
+    ggml_tensor * get_qsa_blk_k(int32_t il) const;
 
     // QSA counts block positions from this one: 1 for the qwen4exp MTP draft, whose cache holds no position 0
     // (cell P pairs token P with the target's state at P - 1), so its blocks group the cells as the reference does
@@ -116,7 +117,7 @@ public:
 
     // bring the layout of each QSA ratio up to date for this ubatch and decide how its block keys are computed
     // called when the ubatch is applied, before the graph is built or reused (the graph's shape follows the plan)
-    // strm: the stream of a ubatch that holds one (n_ns == 1); a ubatch over several streams gets no cache
+    // strm, n_ns: the first stream of the ubatch and how many it covers; a ubatch over several streams gets no plan
     void qsa_prepare(const llama_ubatch & ubatch, uint32_t lo, int64_t n_kv, uint32_t strm, uint32_t n_ns,
                      std::map<uint32_t, qsa_blk_plan> & plans) const;
 
@@ -205,7 +206,7 @@ private:
     // seen qsa_rm_cells yet, so the ubatch's set_input_qsa calls must leave them for its next update
     mutable bool qsa_rm_keep = false;
 
-    // block-key cache, keyed qsa_key(strm, il)
+    // block-key cache, keyed by layer
     std::map<uint32_t, ggml_tensor *> qsa_blk_k;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_blk_bufs;
     std::vector<uint32_t> qsa_ratios;   // distinct ratios of the QSA layers

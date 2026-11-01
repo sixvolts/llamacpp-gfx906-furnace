@@ -87,7 +87,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }
 
     // the block-key cache follows a block id across steps, which a stream's cached layouts give; with separate caches per
-    // sequence each stream gets its own rows (a ubatch over several streams pools without it)
+    // sequence each stream gets its own rows (a ubatch over several streams writes them but does not trust them)
     static const bool blk_cache = getenv("LLAMA_QSA_BLK_CACHE") == nullptr || atoi(getenv("LLAMA_QSA_BLK_CACHE")) != 0;
     if (!blk_cache) {
         return;
@@ -103,16 +103,15 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         ggml_backend_buffer_type_t buft = offload ? ggml_backend_dev_buffer_type(model.dev_layer(il)) : ggml_backend_cpu_buffer_type();
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
-            ggml_init_params params = { /*.mem_size =*/ 64*ggml_tensor_overhead(), /*.mem_buffer =*/ NULL, /*.no_alloc =*/ true };
+            // one tensor per QSA layer at most
+            ggml_init_params params = { /*.mem_size =*/ model.hparams.n_layer_all*ggml_tensor_overhead(), /*.mem_buffer =*/ NULL, /*.no_alloc =*/ true };
             ggml_context * ctx = ggml_init(params);
             qsa_blk_bufs.emplace_back(ggml_context_ptr(ctx), nullptr);
             it = ctx_map.emplace(buft, ctx).first;
         }
-        for (uint32_t s = 0; s < mem_idx->get_n_stream(); ++s) {
-            ggml_tensor * t = ggml_new_tensor_2d(it->second, GGML_TYPE_F32, idx_dim, mem_idx->get_size()/r + 1);
-            ggml_format_name(t, "qsa_blk_k_l%u_s%u", il, s);
-            qsa_blk_k[qsa_key(s, il)] = t;
-        }
+        ggml_tensor * t = ggml_new_tensor_3d(it->second, GGML_TYPE_F32, idx_dim, mem_idx->get_size()/r + 1, mem_idx->get_n_stream());
+        ggml_format_name(t, "qsa_blk_k_l%u", il);
+        qsa_blk_k[il] = t;
     }
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
@@ -134,8 +133,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }
 }
 
-ggml_tensor * llama_memory_hybrid_idx::get_qsa_blk_k(int32_t il, uint32_t strm) const {
-    const auto it = qsa_blk_k.find(qsa_key(strm, (uint32_t) il));
+ggml_tensor * llama_memory_hybrid_idx::get_qsa_blk_k(int32_t il) const {
+    const auto it = qsa_blk_k.find((uint32_t) il);
     return it == qsa_blk_k.end() ? nullptr : it->second;
 }
 
@@ -1209,7 +1208,18 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
     plans.clear();
     qsa_rm_keep = false;
 
-    if (qsa_blk_k.empty() || !mem_idx || n_ns != 1 || ubatch.n_tokens == 0) {
+    if (qsa_blk_k.empty() || !mem_idx || ubatch.n_tokens == 0) {
+        return;
+    }
+
+    // a ubatch over several streams pools every block of each of them into its cache rows (mode 1, no plan), with the
+    // block ids of a layout it builds for this ubatch alone: the rows no longer match the cached layouts
+    if (n_ns != 1) {
+        for (uint32_t s = strm; s < strm + n_ns; ++s) {
+            for (const uint32_t r : qsa_ratios) {
+                qsa_keys[qsa_key(s, r)].valid = false;
+            }
+        }
         return;
     }
 
@@ -1353,8 +1363,10 @@ void llama_memory_hybrid_idx::set_input_qsa_re(ggml_tensor * re_cells, ggml_tens
     int32_t * d_pos   = (int32_t *) re_pos->data;
     int64_t * d_ids   = (int64_t *) re_ids->data;
 
-    // the padding slots re-pool block 0 into the spare last row of the cache
-    const int64_t spare = (int64_t) mem_idx->get_size()/r;
+    // the padding slots re-pool block 0 into the spare last row of the stream's cache rows
+    const int64_t n_rows = (int64_t) mem_idx->get_size()/r + 1;
+    const int64_t row0   = (int64_t) plan.strm*n_rows;
+    const int64_t spare  = n_rows - 1;
     for (int64_t k = 0; k < n_re; ++k) {
         const bool    real = k < (int64_t) plan.bids.size();
         const int32_t b    = real ? plan.bids[k] : 0;
@@ -1365,7 +1377,7 @@ void llama_memory_hybrid_idx::set_input_qsa_re(ggml_tensor * re_cells, ggml_tens
         for (int64_t sec = 0; sec < 4; ++sec) {
             d_pos[sec*n_re + k] = p;
         }
-        d_ids[k] = real ? b : spare;
+        d_ids[k] = row0 + (real ? b : spare);
     }
 }
 

@@ -917,10 +917,16 @@ public:
             mctx->set_input_qsa_re(re_cells, re_pos, re_ids, ratio);
         }
         if (blk_mode == 1) {
+            // the cache row of block b of the ubatch's stream s, s*n_blocks + b, in the flattened cache
             GGML_ASSERT(ggml_backend_buffer_is_host(blk_ids->buffer));
             int64_t * d = (int64_t *) blk_ids->data;
-            for (int64_t b = 0; b < blk_ids->ne[0]; ++b) {
-                d[b] = b;
+            const int64_t ns = mctx->get_n_stream();
+            const int64_t nb = blk_ids->ne[0]/ns;
+            const int64_t s0 = mctx->get_strm();
+            for (int64_t s = 0; s < ns; ++s) {
+                for (int64_t b = 0; b < nb; ++b) {
+                    d[s*nb + b] = (s0 + s)*blk_rows + b;
+                }
             }
         }
     }
@@ -997,8 +1003,9 @@ public:
     int32_t       n_re     = 0;
     ggml_tensor * re_cells = nullptr;   // I32 [ratio*n_re]
     ggml_tensor * re_pos   = nullptr;   // I32 [4*n_re]
-    ggml_tensor * re_ids   = nullptr;   // I64 [n_re]
-    ggml_tensor * blk_ids  = nullptr;   // I64 [n_blocks] mode 1: 0 .. n_blocks - 1
+    ggml_tensor * re_ids   = nullptr;   // I64 [n_re] rows of the flattened cache
+    ggml_tensor * blk_ids  = nullptr;   // I64 [n_blocks*n_stream] mode 1: every block of every stream of the ubatch
+    int64_t       blk_rows = 0;         // cache rows per stream
 
     std::vector<int32_t> shadow_cells;  // blk_cells / blk_pos when the graph does not allocate them
     std::vector<int32_t> shadow_pos;
@@ -1067,8 +1074,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_set_input(qsa->bias);
 
             int32_t n_re = 0;
-            qsa->blk_mode = mctx_hyb->get_mem()->get_qsa_blk_k(il, mctx_hyb->get_strm()) != nullptr && n_stream == 1 ?
-                llm_graph_input_qsa::blk_mode_for(mctx_hyb, (uint32_t) r, scores, n_re) : 0;
+            // a ubatch over several streams has no plan, so it takes mode 1: the graph is the same for any streams
+            const ggml_tensor * blk_k = mctx_hyb->get_mem()->get_qsa_blk_k(il);
+            qsa->blk_mode = blk_k != nullptr ? llm_graph_input_qsa::blk_mode_for(mctx_hyb, (uint32_t) r, scores, n_re) : 0;
+            qsa->blk_rows = blk_k != nullptr ? blk_k->ne[1] : 0;
             if (qsa->blk_mode == 2) {
                 qsa->n_re     = n_re;
                 qsa->re_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r*n_re);
@@ -1079,7 +1088,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                 ggml_set_input(qsa->re_ids);
             }
             if (qsa->blk_mode == 1) {
-                qsa->blk_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_blocks);
+                qsa->blk_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_blocks*n_stream);
                 ggml_set_input(qsa->blk_ids);
             }
         }
@@ -1141,20 +1150,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // the block-key cache (llama_memory_hybrid_idx::get_qsa_blk_k): every step pools, norms and ropes each block on
     // its own, so a cached row equals what a full pass computes and the scores are the same
-    // the cache of the ubatch's stream (separate caches per sequence keep one per stream)
-    ggml_tensor * blk_k = inp->blk_mode != 0 ? mctx_hyb->get_mem()->get_qsa_blk_k(il, mctx_hyb->get_strm()) : nullptr;
-    GGML_ASSERT(inp->blk_mode == 0 || (blk_k != nullptr && n_stream == 1 && n_blocks < blk_k->ne[1]));
+    // one tensor [idx_dim, rows, all streams]; the ubatch's streams are s0 .. s0 + n_stream - 1
+    ggml_tensor * blk_k = inp->blk_mode != 0 ? mctx_hyb->get_mem()->get_qsa_blk_k(il) : nullptr;
+    const int64_t s0    = mctx_hyb->get_strm();
+    GGML_ASSERT(inp->blk_mode == 0 || (blk_k != nullptr && n_blocks < blk_k->ne[1] && s0 + n_stream <= blk_k->ne[2]));
+    GGML_ASSERT(inp->blk_mode != 2 || n_stream == 1);
 
     ggml_tensor * pooled = nullptr;
     if (blk_k != nullptr) {
-        // pool a list of blocks into their cache rows and score from the cache: every block (mode 1, ids 0 ..
-        // n_blocks - 1) or only the new ones and the ones whose cells were rewritten (mode 2). One graph shape for
-        // both, and for the worst-case reserve, so the allocator plan fits every step
+        // pool a list of blocks into their cache rows and score from the cache: every block of every stream (mode 1)
+        // or only the new ones and the ones whose cells were rewritten (mode 2, one stream). The ids are rows of the
+        // flattened cache, so the graph has the same nodes for one stream, several and the worst-case reserve, and
+        // one allocator plan fits every step
         const bool    re    = inp->blk_mode == 2;
-        const int64_t n_lst = re ? inp->n_re : n_blocks;
-        ggml_tensor * fresh = pool_blocks(re ? inp->re_cells : inp->blk_cells, re ? inp->re_pos : inp->blk_pos, n_lst, 1);
-        ggml_tensor * upd   = ggml_set_rows(ctx0, blk_k, ggml_reshape_2d(ctx0, fresh, idx_dim, n_lst), re ? inp->re_ids : inp->blk_ids);
-        pooled = ggml_view_3d(ctx0, upd, idx_dim, n_blocks, 1, upd->nb[1], upd->nb[1]*n_blocks, 0);
+        const int64_t n_lst = re ? inp->n_re : n_blocks*n_stream;
+        ggml_tensor * fresh = re ? pool_blocks(inp->re_cells, inp->re_pos, inp->n_re, 1)
+                                 : pool_blocks(inp->blk_cells, inp->blk_pos, n_blocks, n_stream);
+        ggml_tensor * flat  = ggml_reshape_2d(ctx0, blk_k, idx_dim, blk_k->ne[1]*blk_k->ne[2]);
+        ggml_tensor * ids   = re ? inp->re_ids : inp->blk_ids;
+        ggml_tensor * upd   = ggml_set_rows(ctx0, flat, ggml_reshape_2d(ctx0, fresh, idx_dim, n_lst), ids);
+        // one stream: the rows are contiguous, as before
+        const size_t  nb2   = upd->nb[1]*(n_stream == 1 ? n_blocks : blk_k->ne[1]);
+        pooled = ggml_view_3d(ctx0, upd, idx_dim, n_blocks, n_stream, upd->nb[1], nb2, upd->nb[1]*s0*blk_k->ne[1]);
     } else {
         pooled = pool_blocks(inp->blk_cells, inp->blk_pos, n_blocks, n_stream);
     }
