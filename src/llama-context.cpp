@@ -645,22 +645,15 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
 // Only a pipelined context drains: elsewhere a reallocation syncs the context's own backends, and the restore
 // itself cost more. The MTP draft's K/V-only catch-up graph never fits the worst-case plan, so every catch-up
 // ubatch restored (~8 ms) and then reallocated again. LLAMA_REALLOC_RESTORE_ALL=1 restores in every context.
-// Without a unified cache a ubatch of one sequence builds a one-stream graph (qwen4exp then takes its block-key
-// cache path), which the all-streams worst case does not match: every prompt ubatch reallocated, restored and
-// drained the pipeline, and long prompts read ~3x slower. one_seq restores the one-stream worst case instead,
-// and a change between the two kinds restores before the ubatch that needs it even without a reallocation:
-// otherwise the first ubatch of the other kind reallocated and the next one restored, two drains.
-void llama_context::sched_restore_worst_case(bool one_seq) {
+void llama_context::sched_restore_worst_case() {
     static const bool disabled = getenv("LLAMA_NO_REALLOC_RESTORE") != nullptr;
     static const bool all      = getenv("LLAMA_REALLOC_RESTORE_ALL") != nullptr;
     if (disabled || !sched || !memory || sched_need_reserve || (!cparams.pipeline_parallel && !all)) {
         return;
     }
 
-    const bool want_one = one_seq && !cparams.kv_unified && cparams.n_seq_max > 1 && !sched_one_stream_missing;
-
     const int64_t n_realloc = ggml_backend_sched_get_n_realloc(sched.get());
-    if (n_realloc == sched_n_realloc_seen && want_one == sched_plan_one_stream) {
+    if (n_realloc == sched_n_realloc_seen) {
         return;
     }
 
@@ -669,18 +662,13 @@ void llama_context::sched_restore_worst_case(bool one_seq) {
     // the reallocation already drained every backend; wait for anything queued since
     ggml_backend_sched_synchronize(sched.get());
 
-    auto mctx = want_one ? memory->init_full_one_stream() : nullptr;
-    const bool one_strm = mctx != nullptr;
-    sched_one_stream_missing |= want_one && !one_strm;
-    if (!one_strm) {
-        mctx = memory->init_full();
-    }
+    const auto mctx = memory->init_full();
     if (!mctx) {
         LLAMA_LOG_ERROR("%s: failed to initialize memory context\n", __func__);
         return;
     }
 
-    const uint32_t n_seqs        = one_strm ? 1 : cparams.n_seq_max;
+    const uint32_t n_seqs        = cparams.n_seq_max;
     const uint32_t n_tokens      = std::min(cparams.n_ctx, cparams.n_ubatch);
     const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
@@ -688,11 +676,10 @@ void llama_context::sched_restore_worst_case(bool one_seq) {
         LLAMA_LOG_ERROR("%s: failed to reserve the worst-case graph\n", __func__);
     }
 
-    sched_n_realloc_seen  = ggml_backend_sched_get_n_realloc(sched.get());
-    sched_plan_one_stream = one_strm;
+    sched_n_realloc_seen = ggml_backend_sched_get_n_realloc(sched.get());
 
-    LLAMA_LOG_INFO("%s: restored the worst-case plan%s after %lld reallocations in %.1f ms\n", __func__,
-            one_strm ? " (one stream)" : "", (long long) n_realloc, (ggml_time_us() - t_start_us)/1000.0);
+    LLAMA_LOG_INFO("%s: restored the worst-case plan after %lld reallocations in %.1f ms\n", __func__,
+            (long long) n_realloc, (ggml_time_us() - t_start_us)/1000.0);
 }
 
 void llama_context::sched_reserve() {
@@ -722,8 +709,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    sched_n_realloc_seen  = 0;
-    sched_plan_one_stream = false; // the reserve below is the all-streams worst case
+    sched_n_realloc_seen = 0;
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1966,15 +1952,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    // prompt-sized batches get the worst-case allocator plan back, see sched_restore_worst_case(): the kind
-    // the batch needs, one stream when every token belongs to one sequence
+    // prompt-sized batches get the worst-case allocator plan back, see sched_restore_worst_case()
     if (batch_inp.n_tokens >= 64) {
-        bool one_seq = true;
-        for (int32_t i = 1; batch_inp.seq_id && i < batch_inp.n_tokens && one_seq; ++i) {
-            one_seq = batch_inp.n_seq_id[i] == 1 && batch_inp.seq_id[i][0] == batch_inp.seq_id[0][0];
-        }
-        one_seq = one_seq && (!batch_inp.seq_id || batch_inp.n_seq_id[0] == 1);
-        sched_restore_worst_case(one_seq);
+        sched_restore_worst_case();
     }
 
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
@@ -2179,7 +2159,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // a reallocation earlier in this batch (a multi-sequence decode ubatch ahead of the prompt tokens)
         // re-planned the allocator for that shape; every prompt ubatch after it would reallocate again
         if (ubatch.n_tokens >= 64) {
-            sched_restore_worst_case(ubatch.n_seqs_unq == 1);
+            sched_restore_worst_case();
         }
 
         const int64_t t_ub0 = ggml_time_us();

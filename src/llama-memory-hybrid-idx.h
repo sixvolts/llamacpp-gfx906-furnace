@@ -55,7 +55,6 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
-    llama_memory_context_ptr init_full_one_stream() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -244,8 +243,7 @@ public:
     explicit llama_memory_hybrid_idx_context(llama_memory_status status);
 
     // used to create a full-cache context
-    // init full; one_stream: the worst case of a one-stream ubatch, which builds the block-key cache path
-    explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, bool one_stream = false);
+    explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem);
 
     // used to create an update context
     llama_memory_hybrid_idx_context(
