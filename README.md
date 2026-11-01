@@ -152,7 +152,11 @@ Environment switches for A/B (all default on): `GGML_CUDA_NO_Q8_NC`,
 `LLAMA_NO_REALLOC_RESTORE`, `LLAMA_RS_COPY_ALL_EXTRA`. Tuning:
 `GGML_SCHED_INPUT_STAGE_MB` (pinned staging per device and copy slot,
 256), `LLAMA_ASYNC_INPUT_MIN_TOKENS` (64), `GGML_CUDA_FA_SPARSE_PREFILL_MIN`
-(3), `GGML_CUDA_GDN_CPW` (2 or 4). Diagnostics:
+(3), `GGML_CUDA_GDN_CPW` (2 or 4), `LLAMA_KV_SEQ_HEADROOM` (4096: cells
+kept free after a sequence in a unified qwen4exp cache, and the spacing of
+sequences that start together, at least 256; 256 helps short requests
+started together, but long ones then interleave and decode slower).
+Diagnostics:
 `LLAMA_QSA_LAYOUT_CHECK=1` (rebuild and compare the cached block layout
 every call), `GGML_SCHED_TIME=1` (per-split waits, synchronous input
 copies and graph reallocation reasons), `LLAMA_DECODE_TIME=1`

@@ -1123,8 +1123,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot_window(const llama_ubatch & 
     res.idxs[0].reserve(n_tokens);
 
     // where the next token of each sequence goes: right after the last cell of the sequence, or, for a
-    // sequence with no cells, into the longest free run. sequences starting together split that run
-    // between them, so they do not interleave
+    // sequence with no cells, into the longest free run. sequences starting together are spaced `step`
+    // cells apart in that run (see below); one that grows past its spacing interleaves with the next
     std::unordered_map<llama_seq_id, uint32_t> next;
 
     uint32_t run0 = 0;
@@ -1153,8 +1153,14 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot_window(const llama_ubatch & 
 
         // fresh sequences of one ubatch are decoded together afterwards, and the window of such a ubatch spans all
         // of them: splitting a large run evenly would put them a pool fraction apart (262144 cells for two in a
-        // 524288 pool) and every decode step would attend that whole span. space them by at most the headroom
-        const uint32_t step = n_fresh > 1 ? std::min<uint32_t>(run_len/n_fresh, std::max<uint32_t>(headroom_max, 256)) : 0;
+        // 524288 pool) and every decode step would attend that whole span. space them by at most the headroom.
+        // the spacing is a trade-off: a sequence that grows past it continues after the next sequence's cells, so
+        // two long prompts started together interleave (correct, the cells carry their sequence; the window of a
+        // ubatch holding both stays tight), while a wider spacing would widen the window of short sequences.
+        // never less than one SEQ_CHUNK, so each fresh sequence starts in its own chunk; LLAMA_KV_SEQ_HEADROOM below
+        // that (or 0) still spaces them one chunk apart
+        const uint32_t step = n_fresh > 1 ?
+            std::min<uint32_t>(run_len/n_fresh, std::max<uint32_t>(headroom_max, llama_kv_cells::SEQ_CHUNK)) : 0;
 
         uint32_t k = 0;
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
