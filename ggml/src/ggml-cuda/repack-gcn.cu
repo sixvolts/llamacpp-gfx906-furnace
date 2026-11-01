@@ -8,6 +8,7 @@
 #include "vecdotq.cuh"
 #include "ggml-quants.h"
 #include <vector>
+#include <cctype>
 #include <cmath>
 
 #include <cstdlib>
@@ -67,39 +68,51 @@ static inline size_t repack_gcn_nbytes(const ggml_type type_in, const int64_t ne
     }
 }
 
+// GGML_CUDA_REPACK and the per-type GGML_CUDA_REPACK_<type> switches: unset -> `def`;
+// a value starting with '0', or "off" / "false" / "no" (any case) -> off; any other value -> on.
+static bool repack_env_enabled(const char * name, bool def) {
+    const char * e = getenv(name);
+    if (e == nullptr) {
+        return def;
+    }
+    if (e[0] == '0') {
+        return false;
+    }
+    for (const char * off : { "off", "false", "no" }) {
+        size_t i = 0;
+        while (off[i] != '\0' && tolower((unsigned char) e[i]) == off[i]) {
+            i++;
+        }
+        if (off[i] == '\0' && e[i] == '\0') {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // 2D weights (MUL_MAT) or 3D per-expert stacks (MUL_MAT_ID)
     if ((ggml_n_dims(t) != 2 && ggml_n_dims(t) != 3) || !ggml_is_contiguous(t)) {
         return false;
     }
     switch (t->type) {
-        case GGML_TYPE_Q3_K: {
-            static const bool enabled = [] {
-                const char * e = getenv("GGML_CUDA_REPACK_Q3_K");
-                return e == nullptr || e[0] != '0';
-            }();
-            return enabled && t->ne[0] % 256 == 0;
-        }
-        case GGML_TYPE_Q4_K: {
-            static const bool enabled = [] {
-                const char * e = getenv("GGML_CUDA_REPACK_Q4_K");
-                return e == nullptr || e[0] != '0';
-            }();
-            return enabled && t->ne[0] % 256 == 0;
-        }
-        case GGML_TYPE_Q5_K: {
-            static const bool enabled = [] {
-                const char * e = getenv("GGML_CUDA_REPACK_Q5_K");
-                return e == nullptr || e[0] != '0';
-            }();
-            return enabled && t->ne[0] % 256 == 0;
-        }
+        // K-quants: on by default, one switch per tensor type (GGML_CUDA_REPACK_Q3_K / _Q4_K / _Q5_K / _Q6_K).
+        // Q3_K is stored and run as Q6_K planes (repack_eff_type), but the switch follows the tensor type:
+        // _Q6_K=0 leaves Q3_K tensors repacked on the Q6_K kernels, and _Q3_K=0 does not touch Q6_K tensors.
+        // A tensor that is not repacked runs the stock MMQ / mmvq path. The fused gate/up GLU decode kernel
+        // exists only for repacked weights, so _Q4_K=0 also gives up that fusion for Q4_K gate/up pairs.
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K: {
-            static const bool enabled = [] {
-                const char * e = getenv("GGML_CUDA_REPACK_Q6_K");
-                return e == nullptr || e[0] != '0';
-            }();
-            return enabled && t->ne[0] % 256 == 0;
+            static const bool q3k = repack_env_enabled("GGML_CUDA_REPACK_Q3_K", true);
+            static const bool q4k = repack_env_enabled("GGML_CUDA_REPACK_Q4_K", true);
+            static const bool q5k = repack_env_enabled("GGML_CUDA_REPACK_Q5_K", true);
+            static const bool q6k = repack_env_enabled("GGML_CUDA_REPACK_Q6_K", true);
+            const bool on = t->type == GGML_TYPE_Q3_K ? q3k :
+                            t->type == GGML_TYPE_Q4_K ? q4k :
+                            t->type == GGML_TYPE_Q5_K ? q5k : q6k;
+            return on && t->ne[0] % 256 == 0;
         }
         case GGML_TYPE_Q8_0: {
             // Q8_0 repack is its own opt-in: the repacked MMQ wins
@@ -108,26 +121,17 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
             // tuned on MoE-expert shapes in reinstinct; on-disk Q8_0 is
             // already nearly contiguous so repack buys less). Re-tune
             // before considering it for default-on.
-            static const bool q8 = [] {
-                const char * e = getenv("GGML_CUDA_REPACK_Q8_0");
-                return e != nullptr && e[0] != '0';
-            }();
+            static const bool q8 = repack_env_enabled("GGML_CUDA_REPACK_Q8_0", false);
             return q8 && t->ne[0] % 32 == 0;
         }
         case GGML_TYPE_Q5_1: {
             // opt-in while being validated; K only needs to be a multiple of 32 (qwen4exp ffn_down_exps has K=640)
-            static const bool q51 = [] {
-                const char * e = getenv("GGML_CUDA_REPACK_Q5_1");
-                return e != nullptr && e[0] != '0';
-            }();
+            static const bool q51 = repack_env_enabled("GGML_CUDA_REPACK_Q5_1", false);
             return q51 && t->ne[0] % 32 == 0;
         }
         case GGML_TYPE_Q4_0: {
             // 2D weights only (no expert kernels yet); GGML_CUDA_REPACK_Q4_0=0 opts out
-            static const bool q40 = [] {
-                const char * e = getenv("GGML_CUDA_REPACK_Q4_0");
-                return e == nullptr || e[0] != '0';
-            }();
+            static const bool q40 = repack_env_enabled("GGML_CUDA_REPACK_Q4_0", true);
             return q40 && ggml_n_dims(t) == 2 && t->ne[0] % 32 == 0;
         }
         case GGML_TYPE_IQ4_NL:
@@ -136,10 +140,7 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
             // the IQ family relabels onto the Q4_0 planes (IQ4_NL exactly; IQ4_XS / IQ3_S with the
             // sub-block scale folded to fp16, and IQ3_S at 4.5 instead of 3.44 bpw on device);
             // 2D weights only. GGML_CUDA_REPACK_IQ=0 opts out.
-            static const bool iq = [] {
-                const char * e = getenv("GGML_CUDA_REPACK_IQ");
-                return e == nullptr || e[0] != '0';
-            }();
+            static const bool iq = repack_env_enabled("GGML_CUDA_REPACK_IQ", true);
             return iq && ggml_n_dims(t) == 2 && t->ne[0] % (t->type == GGML_TYPE_IQ4_NL ? 32 : 256) == 0;
         }
         default:             return false;
@@ -6248,11 +6249,10 @@ ggml_backend_buffer_type_t ggml_backend_cuda_repack_buffer_type(int device) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
 
-    // Default-on for GCN; GGML_CUDA_REPACK=0 opts out. (Repacked
+    // Default-on for GCN; GGML_CUDA_REPACK=0 (or off/false/no) opts out. (Repacked
     // weights cannot be read back: llama-quantize/save from a loaded
     // model needs the opt-out.)
-    const char * env = getenv("GGML_CUDA_REPACK");
-    if (env != nullptr && env[0] == '0') {
+    if (!repack_env_enabled("GGML_CUDA_REPACK", true)) {
         return nullptr;
     }
     if (device >= ggml_backend_cuda_get_device_count()) {

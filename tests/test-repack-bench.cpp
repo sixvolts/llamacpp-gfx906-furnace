@@ -4,8 +4,10 @@
 // mmq_gemm_*_repacked exactly as in the model. test-backend-ops cannot do this:
 // it allocates weights in the default buffer type.
 //
-// Needs GGML_CUDA_REPACK_Q8_0=1 GGML_CUDA_REPACK_Q5_1=1 in the environment and a
-// GCN device. Run with HIP_VISIBLE_DEVICES=0 so exactly one GPU is used.
+// Needs a GCN device. Run with HIP_VISIBLE_DEVICES=0 so exactly one GPU is used.
+// Shapes whose type is not repacked are skipped: Q8_0 and Q5_1 are opt-in
+// (GGML_CUDA_REPACK_Q8_0=1 GGML_CUDA_REPACK_Q5_1=1), and GGML_CUDA_REPACK_<type>=0
+// turns a default-on type off.
 //
 // usage: test-repack-bench [--check] [--filter s] [--routing wiki|bench|uniform]
 //        [--sigma f] [--dead f] [--ids-file f] [--dump f] [-r n] [-w n] [-t n] [--seed n]
@@ -16,6 +18,9 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+
+// repack-gcn.cu: the same per-type switch and shape check the model loader uses
+bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t);
 
 #include <algorithm>
 #include <chrono>
@@ -207,6 +212,28 @@ static double time_graph(ggml_backend_t backend, ggml_cgraph * gf, int warmup, i
     ggml_backend_synchronize(backend);
     const auto t1 = std::chrono::high_resolution_clock::now();
     return std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
+}
+
+// whether a [K, N, ne2] weight of `type` would be repacked (set_tensor asserts otherwise)
+static bool repack_on(ggml_type type, int64_t K, int64_t N, int64_t ne2) {
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    const bool on = ggml_cuda_repack_tensor_supported(ggml_new_tensor_3d(ctx, type, K, N, ne2));
+    ggml_free(ctx);
+    return on;
+}
+
+static const char * repack_switch(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q3_K:   return "GGML_CUDA_REPACK_Q3_K";
+        case GGML_TYPE_Q4_K:   return "GGML_CUDA_REPACK_Q4_K";
+        case GGML_TYPE_Q5_K:   return "GGML_CUDA_REPACK_Q5_K";
+        case GGML_TYPE_Q6_K:   return "GGML_CUDA_REPACK_Q6_K";
+        case GGML_TYPE_Q8_0:   return "GGML_CUDA_REPACK_Q8_0";
+        case GGML_TYPE_Q5_1:   return "GGML_CUDA_REPACK_Q5_1";
+        case GGML_TYPE_Q4_0:   return "GGML_CUDA_REPACK_Q4_0";
+        default:               return "GGML_CUDA_REPACK_IQ";
+    }
 }
 
 static bool run_shape(const params & p, ggml_backend_t backend, ggml_backend_buffer_type_t repack_buft,
@@ -491,12 +518,6 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "no *_Repacked buffer type (GGML_CUDA_REPACK=0 or not a GCN device)\n");
         return 1;
     }
-    for (const char * e : { "GGML_CUDA_REPACK_Q8_0", "GGML_CUDA_REPACK_Q5_1" }) {
-        const char * v = getenv(e);
-        if (!v || v[0] == '0') {
-            fprintf(stderr, "warning: %s is not set; shapes of that type are skipped\n", e);
-        }
-    }
     printf("device %s, buft %s, T=%d, reps %d\n", ggml_backend_dev_description(dev),
         ggml_backend_buft_name(repack_buft), p.tokens, p.reps);
 
@@ -570,11 +591,9 @@ int main(int argc, char ** argv) {
                 std::string(ggml_type_name(s.type)).find(p.filter) == std::string::npos) {
             continue;
         }
-        // Q8_0 / Q5_1 repack is opt-in; without it set_tensor would assert
-        const char * opt = s.type == GGML_TYPE_Q8_0 ? "GGML_CUDA_REPACK_Q8_0" :
-                           s.type == GGML_TYPE_Q5_1 ? "GGML_CUDA_REPACK_Q5_1" : nullptr;
-        if (opt && (!getenv(opt) || getenv(opt)[0] == '0')) {
-            printf("%-36s %-5s skipped (%s not set)\n", s.name.c_str(), ggml_type_name(s.type), opt);
+        // a type whose repack is off (Q8_0 / Q5_1 are opt-in) would make set_tensor assert
+        if (!repack_on(s.type, s.K, s.N, s.n_expert > 0 ? s.n_expert : 1)) {
+            printf("%-36s %-5s skipped (repack off: %s)\n", s.name.c_str(), ggml_type_name(s.type), repack_switch(s.type));
             continue;
         }
         all_ok &= run_shape(p, backend, repack_buft, s, fdump);
@@ -582,9 +601,9 @@ int main(int argc, char ** argv) {
 
     // opt-in only (--filter moe_layer), so the default dump layout is unchanged
     if (p.filter.find("moe_layer") != std::string::npos) {
-        const char * v = getenv("GGML_CUDA_REPACK_Q5_1");
-        if (!v || v[0] == '0') {
-            printf("moe_layer skipped (GGML_CUDA_REPACK_Q5_1 not set)\n");
+        // Q4_K gate/up [2560, 640, 512] and Q5_1 down [640, 2560, 512], as in run_moe_layer
+        if (!repack_on(GGML_TYPE_Q4_K, 2560, 640, 512) || !repack_on(GGML_TYPE_Q5_1, 640, 2560, 512)) {
+            printf("moe_layer skipped (repack off: GGML_CUDA_REPACK_Q4_K or GGML_CUDA_REPACK_Q5_1)\n");
         } else {
             for (const auto & r : moe_routings(true)) {
                 all_ok &= run_moe_layer(p, backend, repack_buft, r);

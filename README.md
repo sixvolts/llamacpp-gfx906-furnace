@@ -62,6 +62,16 @@ What it does:
   decode and a grouped 16-token-tile GEMM for prefill.
 - `GGML_CUDA_REPACK_Q8_0=1` and `GGML_CUDA_REPACK_Q5_1=1` additionally
   repack Q8_0 and Q5_1 (opt-in; both are on in the multi-GPU config).
+- Per-type switches for the default-on types: `GGML_CUDA_REPACK_Q3_K`,
+  `_Q4_K`, `_Q5_K`, `_Q6_K`, `_Q4_0` and `_IQ` (IQ4_NL/IQ4_XS/IQ3_S).
+  Setting one to `0` keeps that type on the stock kernels (any switch:
+  a value starting with `0`, or `off`/`false`/`no`, disables it). Q3_K
+  runs on the Q6_K kernels but follows its own switch, and `_Q4_K=0`
+  also gives up the fused gate/up decode kernel. The best mix depends
+  on the box: on one MI50 at 225 W every K type is faster repacked
+  (Qwen3.8-27B UD-Q4_K_XL pp512 325 t/s all on, 216 with
+  `GGML_CUDA_REPACK=0`), while a power-capped card can do better with
+  some types off.
 
 ## Four MI50s: Qwen3.8-Flash-Next / Swift 1.5 (177B MoE, UD-Q4_K_XL)
 
