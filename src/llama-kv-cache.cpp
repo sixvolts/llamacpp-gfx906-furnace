@@ -1151,11 +1151,16 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot_window(const llama_ubatch & 
         run0    += headroom;
         run_len -= headroom;
 
+        // fresh sequences of one ubatch are decoded together afterwards, and the window of such a ubatch spans all
+        // of them: splitting a large run evenly would put them a pool fraction apart (262144 cells for two in a
+        // 524288 pool) and every decode step would attend that whole span. space them by at most the headroom
+        const uint32_t step = n_fresh > 1 ? std::min<uint32_t>(run_len/n_fresh, std::max<uint32_t>(headroom_max, 256)) : 0;
+
         uint32_t k = 0;
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
             const llama_seq_id seq_id = ubatch.seq_id_unq[s];
             if (next.find(seq_id) == next.end()) {
-                next[seq_id] = run0 + (uint32_t) ((uint64_t) run_len*k/n_fresh);
+                next[seq_id] = run0 + step*k;
                 k++;
             }
         }
