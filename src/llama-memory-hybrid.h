@@ -53,6 +53,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_full_one_stream() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -97,8 +98,8 @@ public:
     // init failure
     explicit llama_memory_hybrid_context(llama_memory_status status);
 
-    // init full
-    explicit llama_memory_hybrid_context(llama_memory_hybrid * mem);
+    // init full (one_stream: the attention cache's first stream only, see init_full_one_stream)
+    explicit llama_memory_hybrid_context(llama_memory_hybrid * mem, bool one_stream = false);
 
     // init update
     explicit llama_memory_hybrid_context(

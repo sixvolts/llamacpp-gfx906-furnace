@@ -1067,7 +1067,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_set_input(qsa->bias);
 
             int32_t n_re = 0;
-            qsa->blk_mode = mctx_hyb->get_mem()->get_qsa_blk_k(il) != nullptr && n_stream == 1 ?
+            qsa->blk_mode = mctx_hyb->get_mem()->get_qsa_blk_k(il, mctx_hyb->get_strm()) != nullptr && n_stream == 1 ?
                 llm_graph_input_qsa::blk_mode_for(mctx_hyb, (uint32_t) r, scores, n_re) : 0;
             if (qsa->blk_mode == 2) {
                 qsa->n_re     = n_re;
@@ -1141,7 +1141,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // the block-key cache (llama_memory_hybrid_idx::get_qsa_blk_k): every step pools, norms and ropes each block on
     // its own, so a cached row equals what a full pass computes and the scores are the same
-    ggml_tensor * blk_k = inp->blk_mode != 0 ? mctx_hyb->get_mem()->get_qsa_blk_k(il) : nullptr;
+    // the cache of the ubatch's stream (separate caches per sequence keep one per stream)
+    ggml_tensor * blk_k = inp->blk_mode != 0 ? mctx_hyb->get_mem()->get_qsa_blk_k(il, mctx_hyb->get_strm()) : nullptr;
     GGML_ASSERT(inp->blk_mode == 0 || (blk_k != nullptr && n_stream == 1 && n_blocks < blk_k->ne[1]));
 
     ggml_tensor * pooled = nullptr;

@@ -93,6 +93,10 @@ struct llama_memory_i {
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
+    // the worst case of a ubatch of one sequence when every sequence has its own stream (no unified cache): the
+    // graph then holds one stream, not all of them. nullptr: not supported, the caller reserves init_full()
+    virtual llama_memory_context_ptr init_full_one_stream() { return nullptr; }
+
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;

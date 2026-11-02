@@ -128,6 +128,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_full_one_stream() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -167,6 +168,9 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+
+    // the stream that holds seq_id (0 when unified)
+    uint32_t get_seq_stream(llama_seq_id seq_id) const;
 
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
@@ -371,9 +375,10 @@ public:
     // used for errors
     llama_kv_cache_context(llama_memory_status status);
 
-    // used to create a full-cache context
+    // used to create a full-cache context over the first n_stream streams (0: all of them)
     llama_kv_cache_context(
-            llama_kv_cache * kv);
+            llama_kv_cache * kv,
+            uint32_t n_stream = 0);
 
     // used to create an update context
     llama_kv_cache_context(

@@ -55,7 +55,7 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
-    void sched_restore_worst_case();
+    void sched_restore_worst_case(bool one_seq);
 
     void synchronize();
 
@@ -390,6 +390,10 @@ private:
 
     // sched reallocation count at the last worst-case reserve, see sched_restore_worst_case()
     int64_t sched_n_realloc_seen = 0;
+
+    // the last reserved worst case holds one stream; the memory cannot build one (see sched_restore_worst_case())
+    bool sched_plan_one_stream    = false;
+    bool sched_one_stream_missing = false;
 
     struct llama_turboprefill_state {
         bool enabled = false;

@@ -86,9 +86,10 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         }
     }
 
-    // the block-key cache follows a block id across steps, which the cached layouts give only for one stream
+    // the block-key cache follows a block id across steps, which a stream's cached layouts give; with separate caches per
+    // sequence each stream gets its own rows (a ubatch over several streams pools without it)
     static const bool blk_cache = getenv("LLAMA_QSA_BLK_CACHE") == nullptr || atoi(getenv("LLAMA_QSA_BLK_CACHE")) != 0;
-    if (!blk_cache || mem_idx->get_n_stream() != 1) {
+    if (!blk_cache) {
         return;
     }
 
@@ -107,9 +108,11 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             qsa_blk_bufs.emplace_back(ggml_context_ptr(ctx), nullptr);
             it = ctx_map.emplace(buft, ctx).first;
         }
-        ggml_tensor * t = ggml_new_tensor_2d(it->second, GGML_TYPE_F32, idx_dim, mem_idx->get_size()/r + 1);
-        ggml_format_name(t, "qsa_blk_k_l%u", il);
-        qsa_blk_k[(int32_t) il] = t;
+        for (uint32_t s = 0; s < mem_idx->get_n_stream(); ++s) {
+            ggml_tensor * t = ggml_new_tensor_2d(it->second, GGML_TYPE_F32, idx_dim, mem_idx->get_size()/r + 1);
+            ggml_format_name(t, "qsa_blk_k_l%u_s%u", il, s);
+            qsa_blk_k[qsa_key(s, il)] = t;
+        }
     }
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
@@ -131,8 +134,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }
 }
 
-ggml_tensor * llama_memory_hybrid_idx::get_qsa_blk_k(int32_t il) const {
-    const auto it = qsa_blk_k.find(il);
+ggml_tensor * llama_memory_hybrid_idx::get_qsa_blk_k(int32_t il, uint32_t strm) const {
+    const auto it = qsa_blk_k.find(qsa_key(strm, (uint32_t) il));
     return it == qsa_blk_k.end() ? nullptr : it->second;
 }
 
@@ -211,6 +214,10 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
     return std::make_unique<llama_memory_hybrid_idx_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_hybrid_idx::init_full_one_stream() {
+    return std::make_unique<llama_memory_hybrid_idx_context>(this, true);
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
 }
@@ -229,8 +236,9 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     // a tail removal (speculative drafts, a trimmed prompt) keeps the cached layouts: the next update sees the emptied
     // cells, or, when a cell is filled again at the same position, keeps its block and re-pools that block's key
     if (seq_id >= 0 && mem_idx && !qsa_blk_k.empty() && (!qsa_layouts.empty() || !qsa_layouts_ms.empty())) {
-        mem_idx->get_cells(seq_id).seq_cells_in(seq_id, p0, p1, qsa_rm_cells);
-        if (qsa_rm_cells.size() > (size_t) mem_idx->get_size()) {
+        auto & rm = qsa_rm_cells[mem_idx->get_seq_stream(seq_id)];
+        mem_idx->get_cells(seq_id).seq_cells_in(seq_id, p0, p1, rm);
+        if (rm.size() > (size_t) mem_idx->get_size()) {
             qsa_layouts_drop();
         }
     } else {
@@ -713,6 +721,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const qsa_cells cells = { get_mem_idx()->get_cells(seq_of_stream), lo, vis, (llama_pos) qsa_pos_off };
+        const uint32_t  key   = qsa_key(get_mem_idx()->get_seq_stream(seq_of_stream), ratio);
+        auto &          rm    = qsa_rm_cells[key >> 8];
 
         int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
@@ -731,18 +741,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         const bool one_seq = n_seq_present <= 1;
 
-        qsa_layout    * lay    = n_ns == 1 &&  one_seq ? &qsa_layouts[ratio] : nullptr;
-        qsa_layout_ms * lay_ms = n_ns == 1 && !one_seq && !qsa_layout_ms_disabled() ? &qsa_layouts_ms[ratio] : nullptr;
+        qsa_layout    * lay    = n_ns == 1 &&  one_seq ? &qsa_layouts[key] : nullptr;
+        qsa_layout_ms * lay_ms = n_ns == 1 && !one_seq && !qsa_layout_ms_disabled() ? &qsa_layouts_ms[key] : nullptr;
 
         // fresh: qsa_prepare already advanced or rebuilt this layout for this ubatch (bias != nullptr: the real call)
-        const bool fresh = n_ns == 1 && bias != nullptr && qsa_fresh[ratio] && !qsa_layout_check() &&
+        const bool fresh = n_ns == 1 && bias != nullptr && qsa_fresh[key] && !qsa_layout_check() &&
             ((lay != nullptr && lay->valid && lay->n_kv == n_kv && cells.same(*lay)) ||
              (lay_ms != nullptr && lay_ms->valid && lay_ms->n_kv == n_kv && cells.same(*lay_ms)));
-        qsa_fresh[ratio] = false;
+        qsa_fresh[key] = false;
 
-        bool cached = lay != nullptr && (fresh ? lay->valid : qsa_layout_advance(*lay, cells, n_kv, n_blocks, r, qsa_rm_cells));
+        bool cached = lay != nullptr && (fresh ? lay->valid : qsa_layout_advance(*lay, cells, n_kv, n_blocks, r, rm));
 
-        const bool cached_ms = lay_ms != nullptr && (fresh ? lay_ms->valid : qsa_layout_ms_advance(*lay_ms, cells, n_kv, n_blocks, r, qsa_rm_cells));
+        const bool cached_ms = lay_ms != nullptr && (fresh ? lay_ms->valid : qsa_layout_ms_advance(*lay_ms, cells, n_kv, n_blocks, r, rm));
 
         // check mode: keep the cached layout aside, rebuild, then compare the two
         std::vector<int32_t> chk_cell_blk;
@@ -1187,22 +1197,27 @@ void llama_memory_hybrid_idx::set_input_qsa(
         }
     }
 
-    // every cached layout has now seen the removals, unless qsa_prepare skipped one
-    if (!qsa_rm_keep) {
-        qsa_rm_cells.clear();
+    // every cached layout of the stream has now seen the removals, unless qsa_prepare skipped one. a ubatch over several
+    // streams updates no layout, so their removals stay for the next update of each stream
+    if (n_ns == 1) {
+        const uint32_t strm = get_mem_idx()->get_seq_stream(ubatch->seq_id[0][0]);
+        if (!qsa_rm_keep) {
+            qsa_rm_cells[strm].clear();
+        }
+        qsa_last_kind[qsa_key(strm, ratio)] = last_kind;
     }
-
-    qsa_last_kind[ratio] = last_kind;
 }
 
-void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t lo, int64_t n_kv,
+void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t lo, int64_t n_kv, uint32_t strm, uint32_t n_ns,
         std::map<uint32_t, qsa_blk_plan> & plans) const {
     plans.clear();
     qsa_rm_keep = false;
 
-    if (qsa_blk_k.empty() || !mem_idx || mem_idx->get_n_stream() != 1 || ubatch.n_tokens == 0) {
+    if (qsa_blk_k.empty() || !mem_idx || n_ns != 1 || ubatch.n_tokens == 0) {
         return;
     }
+
+    auto & rm_strm = qsa_rm_cells[strm];
 
     std::vector<int32_t> cell_blk_v;
     std::vector<int32_t> blk_cells_v;
@@ -1240,27 +1255,29 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
         t_blk_pos  .ne[0] = 4*n_blocks; t_blk_pos  .ne[1] = 1; t_blk_pos  .data = blk_pos_v  .data();
 
         // keep the removals for the other ratios: set_input_qsa consumes them
-        const std::vector<uint32_t> rm = qsa_rm_cells;
+        const uint32_t key = qsa_key(strm, r);
+        const std::vector<uint32_t> rm = rm_strm;
         set_input_qsa(&t_cell_blk, &t_blk_cells, &t_blk_pos, nullptr, &ubatch, r, true, lo);
-        qsa_rm_cells = rm;
-        qsa_fresh[r] = true;
+        rm_strm = rm;
+        qsa_fresh[key] = true;
 
         // the layout the update used, if it keeps block ids from step to step
-        const int kind = qsa_last_kind[r];
+        const int kind = qsa_last_kind[key];
         uint64_t gen   = 0;
         int32_t  n_bid = 0;
         std::vector<int32_t> * dirty = nullptr;
         if (kind == 1) {
-            auto & L = qsa_layouts.at(r);
+            auto & L = qsa_layouts.at(key);
             gen = L.gen; n_bid = (int32_t) L.bid_idx.size(); dirty = &L.dirty;
         } else if (kind == 2) {
-            auto & L = qsa_layouts_ms.at(r);
+            auto & L = qsa_layouts_ms.at(key);
             gen = L.gen; n_bid = (int32_t) L.bid_idx.size(); dirty = &L.dirty;
         }
         plan.kind = kind;
+        plan.strm = strm;
         plan.gen  = gen;
 
-        qsa_key_state & ks = qsa_keys[r];
+        qsa_key_state & ks = qsa_keys[key];
 
         plan.n_re = (int32_t) (ubatch.n_tokens/r + 2*ubatch.n_seqs_unq + 2);
 
@@ -1313,7 +1330,7 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
     // every ratio's layout has seen the removals, so set_input_qsa for this ubatch finds nothing new. a ratio that
     // skipped its update keeps them for the next one: a layout that comes back must still see its rewritten cells
     if (!skipped) {
-        qsa_rm_cells.clear();
+        rm_strm.clear();
     }
     qsa_rm_keep = skipped;
 }
@@ -1330,9 +1347,10 @@ void llama_memory_hybrid_idx::set_input_qsa_re(ggml_tensor * re_cells, ggml_tens
 
     // the layout qsa_prepare planned with
     GGML_ASSERT(plan.kind == 1 || plan.kind == 2);
-    const std::vector<int32_t> & blk_cells = plan.kind == 1 ? qsa_layouts.at(ratio).blk_cells : qsa_layouts_ms.at(ratio).blk_cells;
-    const std::vector<int32_t> & bid_idx   = plan.kind == 1 ? qsa_layouts.at(ratio).bid_idx   : qsa_layouts_ms.at(ratio).bid_idx;
-    const uint64_t               gen       = plan.kind == 1 ? qsa_layouts.at(ratio).gen       : qsa_layouts_ms.at(ratio).gen;
+    const uint32_t               key       = qsa_key(plan.strm, ratio);
+    const std::vector<int32_t> & blk_cells = plan.kind == 1 ? qsa_layouts.at(key).blk_cells : qsa_layouts_ms.at(key).blk_cells;
+    const std::vector<int32_t> & bid_idx   = plan.kind == 1 ? qsa_layouts.at(key).bid_idx   : qsa_layouts_ms.at(key).bid_idx;
+    const uint64_t               gen       = plan.kind == 1 ? qsa_layouts.at(key).gen       : qsa_layouts_ms.at(key).gen;
     GGML_ASSERT(gen == plan.gen && "qsa: the block-key plan lost its layout");
 
     int32_t * d_cells = (int32_t *) re_cells->data;
@@ -1360,6 +1378,17 @@ void llama_memory_hybrid_idx::set_input_qsa_re(ggml_tensor * re_cells, ggml_tens
 //
 
 // streams in each ubatch's slot info, matching get_k/get_v's `ns`
+static std::vector<uint32_t> llama_memory_hybrid_idx_s0(const llama_kv_cache::slot_info_vec_t & sinfos) {
+    std::vector<uint32_t> res;
+    res.reserve(sinfos.size());
+
+    for (const auto & sinfo : sinfos) {
+        res.push_back(sinfo.strm.empty() ? 0 : (uint32_t) sinfo.strm[0]);
+    }
+
+    return res;
+}
+
 static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::slot_info_vec_t & sinfos) {
     std::vector<uint32_t> res;
     res.reserve(sinfos.size());
@@ -1374,15 +1403,16 @@ static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::sl
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_status status) :
     llama_memory_hybrid_context(status) {}
 
-llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem) :
-    llama_memory_hybrid_context(mem),
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, bool one_stream) :
+    llama_memory_hybrid_context(mem, one_stream),
     mem(mem),
     // graph reservation walks a full context, and qwen4exp builds the sparse attention only when this is set
     // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
-    ns_ubatch(mem->get_mem_idx() == nullptr ?
-        std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
+    ns_ubatch(mem->get_mem_idx() == nullptr ? std::vector<uint32_t>() :
+        std::vector<uint32_t>{ one_stream ? 1u : mem->get_mem_idx()->get_n_stream() }),
+    s0_ubatch(mem->get_mem_idx() == nullptr ? std::vector<uint32_t>() : std::vector<uint32_t>{ 0 }),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx())) {}
+        new llama_kv_cache_context(mem->get_mem_idx(), one_stream ? 1 : 0)) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
@@ -1403,6 +1433,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
     llama_memory_hybrid_context(mem, std::move(sinfos_attn), ubatches),
     mem(mem),
     ns_ubatch(llama_memory_hybrid_idx_ns(sinfos_idx)),
+    s0_ubatch(llama_memory_hybrid_idx_s0(sinfos_idx)),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
         new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {
     is_batch = true;
@@ -1429,7 +1460,7 @@ bool llama_memory_hybrid_idx_context::apply() {
     qsa_plans.clear();
     if (res && is_batch && ctx_idx && mem != nullptr) {
         const auto * idx = get_idx();
-        mem->qsa_prepare(get_ubatch(), idx->get_kv_lo(), idx->get_n_kv(), qsa_plans);
+        mem->qsa_prepare(get_ubatch(), idx->get_kv_lo(), idx->get_n_kv(), get_strm(), get_n_stream(), qsa_plans);
     }
 
     return res;
@@ -1454,6 +1485,12 @@ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
     GGML_ASSERT(i_cur < ns_ubatch.size());
 
     return ns_ubatch[i_cur];
+}
+
+uint32_t llama_memory_hybrid_idx_context::get_strm() const {
+    GGML_ASSERT(i_cur < s0_ubatch.size());
+
+    return s0_ubatch[i_cur];
 }
 
 void llama_memory_hybrid_idx_context::set_input_qsa(

@@ -55,6 +55,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_full_one_stream() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -96,8 +97,9 @@ public:
     // QSA block-key cache: per QSA layer, the finished (pooled, normed, roped) indexer key of every numbered block of
     // the cached layout, F32 [idx_dim, kv_size/ratio + 1] (the last row takes padding writes). A decode step then
     // re-pools only the blocks that are new or whose cells were rewritten, and scores against the cache.
-    // Unified caches only; LLAMA_QSA_BLK_CACHE=0 disables it. nullptr when off
-    ggml_tensor * get_qsa_blk_k(int32_t il) const;
+    // One tensor per stream (a view into a shared one made the scheduler re-reserve the graph every ubatch);
+    // only a ubatch of one stream uses it. LLAMA_QSA_BLK_CACHE=0 disables it. nullptr when off
+    ggml_tensor * get_qsa_blk_k(int32_t il, uint32_t strm) const;
 
     // QSA counts block positions from this one: 1 for the qwen4exp MTP draft, whose cache holds no position 0
     // (cell P pairs token P with the target's state at P - 1), so its blocks group the cells as the reference does
@@ -108,13 +110,16 @@ public:
                                      // 2: pool `bids` only (padded to n_re) and score against the cache
         int32_t n_re = 0;            // re-pooled block slots of the graph (fixed by the ubatch shape)
         int     kind = 0;            // the layout the block ids belong to (see qsa_last_kind)
+        uint32_t strm = 0;           // the stream whose layout and cache rows these are
         uint64_t gen = 0;
         std::vector<int32_t> bids;   // mode 2: the blocks to re-pool
     };
 
     // bring the layout of each QSA ratio up to date for this ubatch and decide how its block keys are computed
     // called when the ubatch is applied, before the graph is built or reused (the graph's shape follows the plan)
-    void qsa_prepare(const llama_ubatch & ubatch, uint32_t lo, int64_t n_kv, std::map<uint32_t, qsa_blk_plan> & plans) const;
+    // strm: the stream of a ubatch that holds one (n_ns == 1); a ubatch over several streams gets no cache
+    void qsa_prepare(const llama_ubatch & ubatch, uint32_t lo, int64_t n_kv, uint32_t strm, uint32_t n_ns,
+                     std::map<uint32_t, qsa_blk_plan> & plans) const;
 
     // mode 2 inputs: re_cells I32 [ratio*n_re] members, re_pos I32 [4*n_re] rope rows, re_ids I64 [n_re] cache rows
     void set_input_qsa_re(ggml_tensor * re_cells, ggml_tensor * re_pos, ggml_tensor * re_ids, uint32_t ratio,
@@ -181,6 +186,10 @@ public:
 private:
     uint32_t qsa_pos_off = 0;
 
+    // the per-ratio state below is kept per stream too (separate caches per sequence: each stream has its own cells,
+    // layouts and cached keys); this is its map key
+    static uint32_t qsa_key(uint32_t strm, uint32_t ratio) { return strm << 8 | ratio; }
+
     mutable std::map<uint32_t, qsa_layout>    qsa_layouts;
     mutable std::map<uint32_t, qsa_layout_ms> qsa_layouts_ms;
 
@@ -189,16 +198,16 @@ private:
 
     mutable uint64_t qsa_gen_next = 1;
 
-    // cells seq_rm emptied since the layouts were last brought up to date (absolute indices of the indexer cache).
+    // cells seq_rm emptied since the layouts were last brought up to date, per stream (indices into the stream's cells).
     // a cell filled again at the same position keeps its block, which then needs its key re-pooled
-    mutable std::vector<uint32_t> qsa_rm_cells;
+    mutable std::map<uint32_t, std::vector<uint32_t>> qsa_rm_cells;
 
     // qsa_prepare skipped a ratio's layout update for this ubatch (window inside the top-k budget): its layout has not
     // seen qsa_rm_cells yet, so the ubatch's set_input_qsa calls must leave them for its next update
     mutable bool qsa_rm_keep = false;
 
-    // block-key cache
-    std::map<int32_t, ggml_tensor *> qsa_blk_k;
+    // block-key cache, keyed qsa_key(strm, il)
+    std::map<uint32_t, ggml_tensor *> qsa_blk_k;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_blk_bufs;
     std::vector<uint32_t> qsa_ratios;   // distinct ratios of the QSA layers
 
@@ -235,7 +244,8 @@ public:
     explicit llama_memory_hybrid_idx_context(llama_memory_status status);
 
     // used to create a full-cache context
-    explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem);
+    // init full; one_stream: the worst case of a one-stream ubatch, which builds the block-key cache path
+    explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, bool one_stream = false);
 
     // used to create an update context
     llama_memory_hybrid_idx_context(
@@ -269,6 +279,9 @@ public:
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
+    // the first stream of the current slot info, the only one when get_n_stream() == 1 (0 if unified)
+    uint32_t get_strm() const;
+
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
@@ -288,9 +301,10 @@ private:
 
     const llama_memory_hybrid_idx * mem = nullptr;
 
-    // streams per ubatch, read from the slot infos before ctx_idx takes them
-    // declared first, so it is initialised while sinfos_idx is still intact
+    // streams per ubatch and the first of them, read from the slot infos before ctx_idx takes them
+    // declared first, so they are initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
+    const std::vector<uint32_t> s0_ubatch;
 
     // null unless the model has an indexer
     const llama_memory_context_ptr ctx_idx;

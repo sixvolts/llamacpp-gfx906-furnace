@@ -126,6 +126,10 @@ llama_memory_context_ptr llama_memory_hybrid::init_full() {
     return std::make_unique<llama_memory_hybrid_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_hybrid::init_full_one_stream() {
+    return std::make_unique<llama_memory_hybrid_context>(this, true);
+}
+
 llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_context>(this, lctx, optimize);
 }
@@ -211,8 +215,8 @@ llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}
 
-llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :
-    ctx_attn(mem->get_mem_attn()->init_full()),
+llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem, bool one_stream) :
+    ctx_attn(one_stream ? mem->get_mem_attn()->init_full_one_stream() : mem->get_mem_attn()->init_full()),
     ctx_recr(mem->get_mem_recr()->init_full()),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
