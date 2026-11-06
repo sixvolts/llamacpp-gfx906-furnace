@@ -765,7 +765,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
         std::vector<int32_t> chk_blk_pos;
         int32_t              chk_n_bid = 0;
 
-        if ((cached_ms || cached) && qsa_layout_check()) {
+        // the rebuild replaces the layout with a new gen, so its block keys are pooled in full on the next ubatch. a
+        // single-sequence layout is checked only over several streams, where the keys are mode 1 anyway: over one
+        // stream the check would turn off the mode 2 it should be checking
+        if ((cached_ms || (cached && n_ns != 1)) && qsa_layout_check()) {
             chk_cell_blk  = cached_ms ? lay_ms->cell_blk  : lay->cell_blk;
             chk_blk_cells = cached_ms ? lay_ms->blk_cells : lay->blk_cells;
             chk_blk_pos   = cached_ms ? lay_ms->blk_pos   : lay->blk_pos;
