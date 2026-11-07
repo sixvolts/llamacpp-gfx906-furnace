@@ -11362,6 +11362,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Qwen QSA: 256/256, gqa 12, budget 2048.
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+    // Qwen QSA with several KV streams: decode and prompt/verify, plus decode just below the stream threshold
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2}, 8192,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2}, 8192, 67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 2}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
     // Qwen QSA prompt ubatches: rows go through the sparse decode path in blocks once n_kv >= 3*n_sel
     for (int nb : {100, 256}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
