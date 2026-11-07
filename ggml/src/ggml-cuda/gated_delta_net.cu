@@ -1,5 +1,6 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ssm-conv.cuh"
 
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
@@ -566,6 +567,29 @@ bool ggml_cuda_gdn_state_gather_elidable(const ggml_cgraph * cgraph, const ggml_
     }
     if (user == nullptr || ggml_nelements(user->src[5]) != ggml_nelements(gr)) {
         return false;
+    }
+    // The skipped gather is read at the GDN launch, so nothing between the two may write the cache. The
+    // recurrent extra copy does when find_slot moved a cell: a sequence in the ubatch then read the row of
+    // the cell moved into its old place.
+    {
+        const ggml_tensor * cache = gdn_state_root(gr->src[0]);
+        bool after_gr = false;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * n = cgraph->nodes[i];
+            if (n == gr) {
+                after_gr = true;
+                continue;
+            }
+            if (!after_gr || ggml_is_empty(n) || ggml_cuda_is_view_or_noop_public(n)) {
+                continue;
+            }
+            if (n == user) {
+                break;
+            }
+            if (gdn_state_root(n) == cache) {
+                return false;
+            }
+        }
     }
     // The GDN launch reads the gather's row indices, but the allocator keeps them alive only up to the
     // gather itself: a node scheduled between the two, or the GDN output, may reuse their memory (the
