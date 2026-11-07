@@ -239,6 +239,26 @@ private:
     mutable int64_t qsa_stat_calls    = 0;
     void qsa_stats_print(const char * when) const;
 
+    // LLAMA_QSA_BLK_VERIFY=N: every N-th decode ubatch that could take mode 2 pools every block instead (mode 1). Before
+    // that, the cache rows mode 2 kept (blocks [0, n_keyed) that this ubatch would not re-pool) are copied to the host;
+    // the next qsa_prepare compares them with the rows the full pass wrote. Only between decode ubatches (see qsa_prepare)
+    struct qsa_verify_rows {
+        uint32_t           il   = 0;
+        uint32_t           strm = 0;
+        std::vector<bool>  skip;   // rows of [0, keys.size()/idx_dim) this ubatch re-pools, not compared
+        std::vector<float> keys;
+    };
+    mutable std::vector<qsa_verify_rows> qsa_verify_pending;
+    mutable int64_t qsa_verify_seen   = 0; // decode ubatches and ratios that could take mode 2
+    mutable int64_t qsa_verify_checks = 0;
+    mutable int64_t qsa_verify_rows_n = 0;
+    mutable int64_t qsa_verify_bad    = 0; // rows not bitwise equal
+    mutable double  qsa_verify_maxd   = 0.0;
+    mutable int64_t qsa_verify_dropped = 0; // pending checks followed by a prompt ubatch
+    mutable bool    qsa_prev_dec      = false; // the last qsa_prepare was for a decode ubatch
+    std::map<uint32_t, uint32_t> qsa_blk_ratio; // layer -> ratio of the block-key cache layers
+    void qsa_verify_compare() const;
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);

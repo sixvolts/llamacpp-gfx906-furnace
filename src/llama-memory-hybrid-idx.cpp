@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
+#include <cstring>
 #include <iterator>
 #include <stdexcept>
 
@@ -112,6 +113,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         ggml_tensor * t = ggml_new_tensor_3d(it->second, GGML_TYPE_F32, idx_dim, mem_idx->get_size()/r + 1, mem_idx->get_n_stream());
         ggml_format_name(t, "qsa_blk_k_l%u", il);
         qsa_blk_k[il] = t;
+        qsa_blk_ratio[il] = r;
     }
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
@@ -1254,9 +1256,57 @@ void llama_memory_hybrid_idx::qsa_stats_print(const char * when) const {
     }
 }
 
+// LLAMA_QSA_BLK_VERIFY=N (see qsa_verify_rows), 0 or unset: off
+static int64_t qsa_blk_verify() {
+    static const int64_t v = getenv("LLAMA_QSA_BLK_VERIFY") ? std::max(0, atoi(getenv("LLAMA_QSA_BLK_VERIFY"))) : 0;
+    return v;
+}
+
+void llama_memory_hybrid_idx::qsa_verify_compare() const {
+    int64_t rows = 0;
+    int64_t bad  = 0;
+    double  maxd = 0.0;
+    std::vector<float> now;
+    for (const auto & p : qsa_verify_pending) {
+        const ggml_tensor * t = qsa_blk_k.at(p.il);
+        now.resize(p.keys.size());
+        ggml_backend_tensor_get(t, now.data(), p.strm*t->nb[2], now.size()*sizeof(float));
+        const int64_t d = t->ne[0];
+        for (size_t row = 0; row < p.skip.size(); ++row) {
+            if (p.skip[row]) {
+                continue;
+            }
+            rows++;
+            const float * a = p.keys.data() + row*d;
+            const float * b = now.data()    + row*d;
+            if (memcmp(a, b, d*sizeof(float)) != 0) {
+                bad++;
+                for (int64_t i = 0; i < d; ++i) {
+                    maxd = std::max(maxd, (double) std::fabs(a[i] - b[i]));
+                }
+            }
+        }
+    }
+    qsa_verify_pending.clear();
+    qsa_verify_checks++;
+    qsa_verify_rows_n += rows;
+    qsa_verify_bad    += bad;
+    qsa_verify_maxd    = std::max(qsa_verify_maxd, maxd);
+    if (bad > 0) {
+        LLAMA_LOG_WARN("qsa_blk_verify: check %" PRId64 ": %" PRId64 " of %" PRId64 " kept rows differ from a full pool, max |diff| %g\n",
+                qsa_verify_checks, bad, rows, maxd);
+    }
+}
+
 llama_memory_hybrid_idx::~llama_memory_hybrid_idx() {
     if (qsa_blk_stats() && qsa_stat_calls > 0) {
         qsa_stats_print("end");
+    }
+    if (qsa_blk_verify() > 0) {
+        LLAMA_LOG_WARN("qsa_blk_verify (end): %" PRId64 " checks, %" PRId64 " kept rows compared, %" PRId64 " differ, max |diff| %g, "
+                "%" PRId64 " dropped%s\n",
+                qsa_verify_checks, qsa_verify_rows_n, qsa_verify_bad, qsa_verify_maxd, qsa_verify_dropped,
+                qsa_verify_pending.empty() ? "" : " (last check not compared)");
     }
 }
 
@@ -1271,6 +1321,21 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
         std::map<uint32_t, qsa_blk_plan> & plans) const {
     plans.clear();
     qsa_rm_keep = false;
+
+    // LLAMA_QSA_BLK_VERIFY: the cache is read only between two decode ubatches, which in practice are separate decode
+    // calls whose outputs were read in between, so the graph that wrote it has finished. a pending check followed by a
+    // prompt ubatch (possibly in the same call, its graph possibly still running) is dropped
+    const bool is_dec = ubatch.n_tokens > 0 && ubatch.n_tokens/std::max<uint32_t>(n_ns, 1) <= QSA_STAT_DECODE_MAX;
+    const bool can_read = is_dec && qsa_prev_dec;
+    qsa_prev_dec = is_dec;
+    if (!qsa_verify_pending.empty()) {
+        if (can_read) {
+            qsa_verify_compare();
+        } else {
+            qsa_verify_pending.clear();
+            qsa_verify_dropped++;
+        }
+    }
 
     if (qsa_blk_k.empty() || !mem_idx || ubatch.n_tokens == 0) {
         return;
@@ -1395,7 +1460,38 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
             plan.bid_s.resize(plan.bids.size(), s);
         }
 
-        if (all_same && (int32_t) plan.bids.size() <= plan.n_re) {
+        // LLAMA_QSA_BLK_VERIFY: keep a copy of the rows mode 2 would trust, then pool every block instead (mode 1 below)
+        bool verify_now = false;
+        if (all_same && (int32_t) plan.bids.size() <= plan.n_re && qsa_blk_verify() > 0 && can_read &&
+                ++qsa_verify_seen % qsa_blk_verify() == 0) {
+            verify_now = true;
+            for (const auto & [il, rl] : qsa_blk_ratio) {
+                if (rl != r) {
+                    continue;
+                }
+                const ggml_tensor * t = qsa_blk_k.at(il);
+                for (uint32_t s = 0; s < n_ns; ++s) {
+                    const int32_t n_keyed = qsa_keys[qsa_key(strm + s, r)].n_keyed;
+                    if (n_keyed <= 0) {
+                        continue;
+                    }
+                    qsa_verify_rows v;
+                    v.il   = il;
+                    v.strm = strm + s;
+                    v.skip.assign(n_keyed, false);
+                    for (size_t i = 0; i < plan.bids.size(); ++i) {
+                        if (plan.bid_s[i] == s && plan.bids[i] < n_keyed) {
+                            v.skip[plan.bids[i]] = true;
+                        }
+                    }
+                    v.keys.resize((size_t) n_keyed*t->ne[0]);
+                    ggml_backend_tensor_get(t, v.keys.data(), (strm + s)*t->nb[2], v.keys.size()*sizeof(float));
+                    qsa_verify_pending.push_back(std::move(v));
+                }
+            }
+        }
+
+        if (all_same && (int32_t) plan.bids.size() <= plan.n_re && !verify_now) {
             plan.mode = 2;
             for (uint32_t s = 0; s < n_ns; ++s) {
                 qsa_keys[qsa_key(strm + s, r)].n_keyed = sk[s].n_bid;
@@ -1434,7 +1530,9 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
             ks.n_keyed = sk[s].n_bid;
             sk[s].dirty->clear();
         }
-        st[no_gen && !any_gen ? 0 : any_new || no_gen ? 1 : 2]++;
+        if (!verify_now) {
+            st[no_gen && !any_gen ? 0 : any_new || no_gen ? 1 : 2]++;
+        }
     }
 
     if (qsa_blk_stats() && ++qsa_stat_calls % 256 == 0) {
