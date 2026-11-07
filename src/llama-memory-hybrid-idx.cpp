@@ -345,6 +345,15 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     } catch (...) {
         // a half-restored context is the one state the indexer cannot fix by itself: attention holds new cells, the indexer old ones
         // drop what was being restored from all of them, which is a state they do agree on.
+        // zero the attention and indexer data read before the failure, since attention still reads free cells. state_clear finds the cells by seq_id, so it goes before state_drop
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            get_mem_attn()->state_clear(seq_id);
+
+            if (mem_idx) {
+                mem_idx->state_clear(seq_id);
+            }
+        }
+
         state_drop(seq_id);
 
         throw;
