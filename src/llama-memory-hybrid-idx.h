@@ -43,7 +43,7 @@ public:
                             /* the indexer cache exists only if this is given */
     const layer_filter_cb & filter_idx);
 
-    ~llama_memory_hybrid_idx() = default;
+    ~llama_memory_hybrid_idx();
 
     //
     // llama_memory_i
@@ -108,20 +108,28 @@ public:
     struct qsa_blk_plan {
         int     mode = 0;            // 0: pool every block, no cache; 1: pool every block and refresh the cache;
                                      // 2: pool `bids` only (padded to n_re) and score against the cache
-        int32_t n_re = 0;            // re-pooled block slots of the graph (fixed by the ubatch shape)
-        int     kind = 0;            // the layout the block ids belong to (see qsa_last_kind)
-        uint32_t strm = 0;           // the stream whose layout and cache rows these are
-        uint64_t gen = 0;
-        std::vector<int32_t> bids;   // mode 2: the blocks to re-pool
+        int32_t n_re = 0;            // re-pooled block slots of the graph (fixed by the ubatch shape), shared by its streams
+
+        struct strm_layout {
+            uint32_t strm = 0;       // the stream whose layout and cache rows these are
+            int      kind = 0;       // the layout the block ids belong to (see qsa_last_kind)
+            uint64_t gen  = 0;
+        };
+        std::vector<strm_layout> strms; // the ubatch's streams, in order: strms[i] is stream strm + i
+
+        std::vector<int32_t>  bids;  // mode 2: the blocks to re-pool
+        std::vector<uint32_t> bid_s; // mode 2: for each of bids, its index in strms
     };
 
     // bring the layout of each QSA ratio up to date for this ubatch and decide how its block keys are computed
     // called when the ubatch is applied, before the graph is built or reused (the graph's shape follows the plan)
-    // strm, n_ns: the first stream of the ubatch and how many it covers; a ubatch over several streams gets no plan
+    // strm, n_ns: the first stream of the ubatch and how many it covers. a ubatch over several streams takes mode 2
+    // only when every stream can (same layout as its keys, few enough changed blocks for the shared n_re slots)
     void qsa_prepare(const llama_ubatch & ubatch, uint32_t lo, int64_t n_kv, uint32_t strm, uint32_t n_ns,
                      std::map<uint32_t, qsa_blk_plan> & plans) const;
 
     // mode 2 inputs: re_cells I32 [ratio*n_re] members, re_pos I32 [4*n_re] rope rows, re_ids I64 [n_re] cache rows
+    // a member is a row of the ubatch's streams laid flat, i*kv_size + cell for the stream strm + i (see build_qsa_top_k)
     void set_input_qsa_re(ggml_tensor * re_cells, ggml_tensor * re_pos, ggml_tensor * re_ids, uint32_t ratio,
                           const qsa_blk_plan & plan) const;
 
@@ -224,6 +232,12 @@ private:
         int32_t  n_keyed = 0;   // blocks [0, n_keyed) hold current keys
     };
     mutable std::map<uint32_t, qsa_key_state> qsa_keys;
+
+    // LLAMA_QSA_BLK_STATS counters per ratio and ubatch: [one stream, several][prompt, decode/verify][no cache, full pool
+    // on new layout, on overflow, cache]; printed every 256 ubatches and when the memory is freed
+    mutable int64_t qsa_stat[2][2][4] = {};
+    mutable int64_t qsa_stat_calls    = 0;
+    void qsa_stats_print(const char * when) const;
 
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
