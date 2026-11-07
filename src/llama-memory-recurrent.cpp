@@ -1391,6 +1391,31 @@ uint32_t llama_memory_recurrent_context::get_n_rs_extra(uint32_t n_seqs) const {
     return 0;
 }
 
+uint32_t llama_memory_recurrent_context::get_n_s_copy(uint32_t n_seqs) const {
+    const uint32_t n_rs = get_n_rs();
+    return n_rs + (n_rs - n_seqs)*mem->n_rs_seq;
+}
+
+uint32_t llama_memory_recurrent_context::get_n_s_copy_extra(uint32_t n_seqs) const {
+    return get_n_rs_extra(n_seqs)*(1 + mem->n_rs_seq);
+}
+
+void llama_memory_recurrent_context::set_input_s_copy(int32_t * data, uint32_t n_seqs) const {
+    const uint32_t n_rs    = get_n_rs();
+    const uint32_t n_extra = n_rs - n_seqs;
+
+    // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+    for (uint32_t i = 0; i < n_rs; ++i) {
+        data[i] = s_copy(i);
+    }
+
+    for (uint32_t p = 1; p <= mem->n_rs_seq; ++p) {
+        for (uint32_t j = 0; j < n_extra; ++j) {
+            data[n_rs + (p - 1)*n_extra + j] = (int32_t) (p*mem->size) + mem->cells[n_seqs + j + mem->head].src0;
+        }
+    }
+}
+
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
