@@ -1688,14 +1688,23 @@ private:
             if (ret != nullptr) {
                 const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
-                if (task.id_slot == -1) {
-                    SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                            f_sim_best, slot_prompt_similarity, f_keep);
-                }
+                if (task.id_slot == -1 && f_keep < 0.5f && f_sim_best < 0.5f) {
+                    // a weak match (most of the slot lost, most of the prompt new, e.g. only the chat template prefix shared)
+                    // has little to reuse but would overwrite a cached conversation: choose by LRU instead, which takes an
+                    // empty slot first and otherwise the least recently used one
+                    SLT_INF(*ret, "weak LCP match, f_sim_best = %.3f, f_keep = %.3f: selecting by LRU instead\n", f_sim_best, f_keep);
 
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
-                    update_cache = true;
+                    ret = nullptr;
+                } else {
+                    if (task.id_slot == -1) {
+                        SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
+                                f_sim_best, slot_prompt_similarity, f_keep);
+                    }
+
+                    // if we are about to lose a large portion of the existing context - save it in the prompt cache
+                    if (f_keep < 0.5f) {
+                        update_cache = true;
+                    }
                 }
             }
         }
