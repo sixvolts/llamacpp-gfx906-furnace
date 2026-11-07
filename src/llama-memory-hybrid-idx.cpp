@@ -228,6 +228,12 @@ void llama_memory_hybrid_idx::clear(bool data) {
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first, before the cells
+    // below are recorded as removed
+    if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+
     // a tail removal (speculative drafts, a trimmed prompt) keeps the cached layouts: the next update sees the emptied
     // cells, or, when a cell is filled again at the same position, keeps its block and re-pools that block's key
     if (seq_id >= 0 && mem_idx && !qsa_blk_k.empty() && (!qsa_layouts.empty() || !qsa_layouts_ms.empty())) {
@@ -238,11 +244,6 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         }
     } else {
         qsa_layouts_drop();
-    }
-
-    // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
-    if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
-        return false;
     }
 
     if (mem_idx) {

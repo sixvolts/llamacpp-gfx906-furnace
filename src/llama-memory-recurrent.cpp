@@ -199,6 +199,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
             // partial rollback via per-token snapshot index (bounded by the snapshots of the last ubatch)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                // a cell shared by several sequences cannot move back for only one of them
+                if (cell.seq_id.size() > 1) {
+                    return false;
+                }
                 // no layer, so only the position moves back
                 if (is_empty()) {
                     cell.pos = p0 - 1;
@@ -291,6 +295,10 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
+            // a pending rollback of the old destination must not apply to the copied cell
+            if ((size_t) seq_id_dst < rs_idx.size()) {
+                rs_idx[seq_id_dst] = 0;
+            }
         }
     }
 }
