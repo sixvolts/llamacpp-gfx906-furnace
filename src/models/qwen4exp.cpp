@@ -1074,7 +1074,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_set_input(qsa->bias);
 
             int32_t n_re = 0;
-            // a ubatch over several streams has no plan, so it takes mode 1: the graph is the same for any streams
+            // mode 2 re-pools a list of blocks over all streams of the ubatch, mode 1 every block: either way the graph
+            // has the same nodes for any streams
             const ggml_tensor * blk_k = mctx_hyb->get_mem()->get_qsa_blk_k(il);
             qsa->blk_mode = blk_k != nullptr ? llm_graph_input_qsa::blk_mode_for(mctx_hyb, (uint32_t) r, scores, n_re) : 0;
             qsa->blk_rows = blk_k != nullptr ? blk_k->ne[1] : 0;
@@ -1113,13 +1114,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     }
 
     // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
-    ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
-    k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
+    ggml_tensor * k_get = mctx_idx->get_k(ctx0, il);
+    ggml_tensor * k_all = ggml_view_3d(ctx0, k_get, idx_dim, n_kv, n_stream, k_get->nb[2], k_get->nb[3], 0);
 
     // pool (mean of the r member keys), norm and rotate nb blocks whose members are `cells` [r*nb, ns], rope rows `pos`
-    auto pool_blocks = [&](ggml_tensor * cells, ggml_tensor * pos, int64_t nb, int64_t ns) {
-        // gathers per stream: cells row s indexes stream s's own cells
-        ggml_tensor * members = ggml_get_rows(ctx0, k_all, cells);
+    // src: k_all, gathered per stream (cells row s indexes stream s's own cells), or the flat rows of every stream
+    auto pool_blocks = [&](ggml_tensor * src, ggml_tensor * cells, ggml_tensor * pos, int64_t nb, int64_t ns) {
+        ggml_tensor * members = ggml_get_rows(ctx0, src, cells);
         members = ggml_reshape_4d(ctx0, members, idx_dim, r, nb, ns);
 
         // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows.
@@ -1154,18 +1155,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * blk_k = inp->blk_mode != 0 ? mctx_hyb->get_mem()->get_qsa_blk_k(il) : nullptr;
     const int64_t s0    = mctx_hyb->get_strm();
     GGML_ASSERT(inp->blk_mode == 0 || (blk_k != nullptr && n_blocks < blk_k->ne[1] && s0 + n_stream <= blk_k->ne[2]));
-    GGML_ASSERT(inp->blk_mode != 2 || n_stream == 1);
 
     ggml_tensor * pooled = nullptr;
     if (blk_k != nullptr) {
         // pool a list of blocks into their cache rows and score from the cache: every block of every stream (mode 1)
-        // or only the new ones and the ones whose cells were rewritten (mode 2, one stream). The ids are rows of the
-        // flattened cache, so the graph has the same nodes for one stream, several and the worst-case reserve, and
-        // one allocator plan fits every step
+        // or only the new ones and the ones whose cells were rewritten (mode 2, over all streams of the ubatch). The ids
+        // are rows of the flattened cache, so the graph has the same nodes for one stream, several and the worst-case
+        // reserve, and one allocator plan fits every step
         const bool    re    = inp->blk_mode == 2;
         const int64_t n_lst = re ? inp->n_re : n_blocks*n_stream;
-        ggml_tensor * fresh = re ? pool_blocks(inp->re_cells, inp->re_pos, inp->n_re, 1)
-                                 : pool_blocks(inp->blk_cells, inp->blk_pos, n_blocks, n_stream);
+        ggml_tensor * fresh = nullptr;
+        if (re) {
+            // mode 2 members are rows of the ubatch's streams laid flat, stream s from row s*kv_size
+            // (llama_memory_hybrid_idx::set_input_qsa_re); the cache keeps its streams kv_size rows apart
+            const int64_t kv_size = mctx_hyb->get_mem()->get_mem_idx()->get_size();
+            GGML_ASSERT(n_stream == 1 || k_get->nb[3] == (size_t) kv_size*k_get->nb[2]);
+            ggml_tensor * k_flat = ggml_view_2d(ctx0, k_get, idx_dim, (n_stream - 1)*kv_size + n_kv, k_get->nb[2], 0);
+            fresh = pool_blocks(k_flat, inp->re_cells, inp->re_pos, inp->n_re, 1);
+        } else {
+            fresh = pool_blocks(k_all, inp->blk_cells, inp->blk_pos, n_blocks, n_stream);
+        }
         ggml_tensor * flat  = ggml_reshape_2d(ctx0, blk_k, idx_dim, blk_k->ne[1]*blk_k->ne[2]);
         ggml_tensor * ids   = re ? inp->re_ids : inp->blk_ids;
         ggml_tensor * upd   = ggml_set_rows(ctx0, flat, ggml_reshape_2d(ctx0, fresh, idx_dim, n_lst), ids);
@@ -1173,7 +1182,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const size_t  nb2   = upd->nb[1]*(n_stream == 1 ? n_blocks : blk_k->ne[1]);
         pooled = ggml_view_3d(ctx0, upd, idx_dim, n_blocks, n_stream, upd->nb[1], nb2, upd->nb[1]*s0*blk_k->ne[1]);
     } else {
-        pooled = pool_blocks(inp->blk_cells, inp->blk_pos, n_blocks, n_stream);
+        pooled = pool_blocks(k_all, inp->blk_cells, inp->blk_pos, n_blocks, n_stream);
     }
     cb(pooled, "indexer_k", il);
 
