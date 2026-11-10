@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
+#include <cstring>
 #include <iterator>
 #include <stdexcept>
 
@@ -112,6 +113,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         ggml_tensor * t = ggml_new_tensor_3d(it->second, GGML_TYPE_F32, idx_dim, mem_idx->get_size()/r + 1, mem_idx->get_n_stream());
         ggml_format_name(t, "qsa_blk_k_l%u", il);
         qsa_blk_k[il] = t;
+        qsa_blk_ratio[il] = r;
     }
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
@@ -1146,8 +1148,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         }
 
+        // the layout this stream used, if it keeps block ids from step to step (read by qsa_prepare for the plan)
+        const int kind_s = lay != nullptr && lay->valid ? 1 : lay_ms != nullptr && lay_ms->valid ? 2 : 0;
         if (n_ns == 1) {
-            last_kind = lay != nullptr && lay->valid ? 1 : lay_ms != nullptr && lay_ms->valid ? 2 : 0;
+            last_kind = kind_s;
+        } else {
+            qsa_last_kind[key] = kind_s;
         }
 
         // a layout-only update (qsa_prepare) stops here
@@ -1236,77 +1242,118 @@ void llama_memory_hybrid_idx::set_input_qsa(
     }
 }
 
+static bool qsa_blk_stats() {
+    static const bool v = getenv("LLAMA_QSA_BLK_STATS") != nullptr;
+    return v;
+}
+
+// tokens per stream up to which a ubatch counts as decode/verify in LLAMA_QSA_BLK_STATS
+static constexpr uint32_t QSA_STAT_DECODE_MAX = 16;
+
+void llama_memory_hybrid_idx::qsa_stats_print(const char * when) const {
+    static const char * strm[2] = { "one stream", "several streams" };
+    static const char * kind[2] = { "prompt", "decode" };
+    for (int a = 0; a < 2; ++a) {
+        for (int b = 0; b < 2; ++b) {
+            const int64_t * n = qsa_stat[a][b];
+            if (n[0] + n[1] + n[2] + n[3] == 0) {
+                continue;
+            }
+            LLAMA_LOG_WARN("qsa_blk_stats (%s, %" PRId64 " ubatches): %s, %s: cache %" PRId64 ", full pool on new layout %" PRId64
+                    ", on overflow %" PRId64 ", no cache %" PRId64 "\n",
+                    when, qsa_stat_calls, strm[a], kind[b], n[3], n[1], n[2], n[0]);
+        }
+    }
+}
+
+// LLAMA_QSA_BLK_VERIFY=N (see qsa_verify_rows), 0 or unset: off
+static int64_t qsa_blk_verify() {
+    static const int64_t v = getenv("LLAMA_QSA_BLK_VERIFY") ? std::max(0, atoi(getenv("LLAMA_QSA_BLK_VERIFY"))) : 0;
+    return v;
+}
+
+void llama_memory_hybrid_idx::qsa_verify_compare() const {
+    int64_t rows = 0;
+    int64_t bad  = 0;
+    double  maxd = 0.0;
+    std::vector<float> now;
+    for (const auto & p : qsa_verify_pending) {
+        const ggml_tensor * t = qsa_blk_k.at(p.il);
+        now.resize(p.keys.size());
+        ggml_backend_tensor_get(t, now.data(), p.strm*t->nb[2], now.size()*sizeof(float));
+        const int64_t d = t->ne[0];
+        for (size_t row = 0; row < p.skip.size(); ++row) {
+            if (p.skip[row]) {
+                continue;
+            }
+            rows++;
+            const float * a = p.keys.data() + row*d;
+            const float * b = now.data()    + row*d;
+            if (memcmp(a, b, d*sizeof(float)) != 0) {
+                bad++;
+                for (int64_t i = 0; i < d; ++i) {
+                    maxd = std::max(maxd, (double) std::fabs(a[i] - b[i]));
+                }
+            }
+        }
+    }
+    qsa_verify_pending.clear();
+    qsa_verify_checks++;
+    qsa_verify_rows_n += rows;
+    qsa_verify_bad    += bad;
+    qsa_verify_maxd    = std::max(qsa_verify_maxd, maxd);
+    if (bad > 0) {
+        LLAMA_LOG_WARN("qsa_blk_verify: check %" PRId64 ": %" PRId64 " of %" PRId64 " kept rows differ from a full pool, max |diff| %g\n",
+                qsa_verify_checks, bad, rows, maxd);
+    }
+}
+
+llama_memory_hybrid_idx::~llama_memory_hybrid_idx() {
+    if (qsa_blk_stats() && qsa_stat_calls > 0) {
+        qsa_stats_print("end");
+    }
+    if (qsa_blk_verify() > 0) {
+        LLAMA_LOG_WARN("qsa_blk_verify (end): %" PRId64 " checks, %" PRId64 " kept rows compared, %" PRId64 " differ, max |diff| %g, "
+                "%" PRId64 " dropped%s\n",
+                qsa_verify_checks, qsa_verify_rows_n, qsa_verify_bad, qsa_verify_maxd, qsa_verify_dropped,
+                qsa_verify_pending.empty() ? "" : " (last check not compared)");
+    }
+}
+
+// LLAMA_QSA_NO_STREAM_MODE2=1: a ubatch over several streams pools every block of every stream (mode 1), as before
+// per-stream mode 2
+static bool qsa_mode2_streams() {
+    static const bool v = getenv("LLAMA_QSA_NO_STREAM_MODE2") == nullptr;
+    return v;
+}
+
 void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t lo, int64_t n_kv, uint32_t strm, uint32_t n_ns,
         std::map<uint32_t, qsa_blk_plan> & plans) const {
     plans.clear();
     qsa_rm_keep = false;
 
+    // LLAMA_QSA_BLK_VERIFY: the cache is read only between two decode ubatches, which in practice are separate decode
+    // calls whose outputs were read in between, so the graph that wrote it has finished. a pending check followed by a
+    // prompt ubatch (possibly in the same call, its graph possibly still running) is dropped
+    const bool is_dec = ubatch.n_tokens > 0 && ubatch.n_tokens/std::max<uint32_t>(n_ns, 1) <= QSA_STAT_DECODE_MAX;
+    const bool can_read = is_dec && qsa_prev_dec;
+    qsa_prev_dec = is_dec;
+    if (!qsa_verify_pending.empty()) {
+        if (can_read) {
+            qsa_verify_compare();
+        } else {
+            qsa_verify_pending.clear();
+            qsa_verify_dropped++;
+        }
+    }
+
     if (qsa_blk_k.empty() || !mem_idx || ubatch.n_tokens == 0) {
         return;
     }
 
-    // a ubatch over several streams pools every block of each of them into its cache rows (mode 1, no plan), with the
-    // block ids of a layout it builds for this ubatch alone: the rows no longer match the cached layouts
-    if (n_ns != 1) {
-        // the layouts are still updated here, once per ubatch and ratio, so that the set_input_qsa of the ubatch copies
-        // them and every ratio sees the removals. their block ids do not reach the keys (mode 1 re-pools every block)
-        if (qsa_layout_streams()) {
-            bool skipped = false;
-
-            std::vector<std::vector<uint32_t>> rm_save(n_ns);
-            for (uint32_t s = 0; s < n_ns; ++s) {
-                rm_save[s] = qsa_rm_cells[strm + s];
-            }
-
-            std::vector<int32_t> cell_blk_v;
-            std::vector<int32_t> blk_cells_v;
-            std::vector<int32_t> blk_pos_v;
-
-            for (const uint32_t r : qsa_ratios) {
-                if (n_kv <= (int64_t) (hparams_idx.indexer_top_k/r)*r + r - 1) {
-                    skipped = true;
-                    continue;
-                }
-
-                const int64_t n_blocks = (n_kv + r - 1)/r;
-
-                cell_blk_v .resize(n_kv*n_ns);
-                blk_cells_v.resize(r*n_blocks*n_ns);
-                blk_pos_v  .resize(4*n_blocks*n_ns);
-
-                ggml_tensor t_cell_blk  = {};
-                ggml_tensor t_blk_cells = {};
-                ggml_tensor t_blk_pos   = {};
-                t_cell_blk .ne[0] = n_kv;            t_cell_blk .ne[1] = n_ns; t_cell_blk .data = cell_blk_v .data();
-                t_blk_cells.ne[0] = r*n_blocks;      t_blk_cells.ne[1] = n_ns; t_blk_cells.data = blk_cells_v.data();
-                t_blk_pos  .ne[0] = 4*n_blocks*n_ns; t_blk_pos  .ne[1] = 1;    t_blk_pos  .data = blk_pos_v  .data();
-
-                set_input_qsa(&t_cell_blk, &t_blk_cells, &t_blk_pos, nullptr, &ubatch, r, true, lo);
-
-                for (uint32_t s = 0; s < n_ns; ++s) {
-                    qsa_rm_cells[strm + s] = rm_save[s];
-                    const uint32_t key = qsa_key(strm + s, r);
-                    qsa_fresh[key] = true;
-                    // the keys are re-pooled in full, so the blocks the removals marked need no extra pass
-                    auto it1 = qsa_layouts.find(key);
-                    if (it1 != qsa_layouts.end()) {
-                        it1->second.dirty.clear();
-                    }
-                    auto it2 = qsa_layouts_ms.find(key);
-                    if (it2 != qsa_layouts_ms.end()) {
-                        it2->second.dirty.clear();
-                    }
-                }
-            }
-
-            if (!skipped) {
-                for (uint32_t s = 0; s < n_ns; ++s) {
-                    qsa_rm_cells[strm + s].clear();
-                }
-            }
-            qsa_rm_keep = skipped;
-        }
-
+    // LLAMA_QSA_NO_STREAM_CACHE=1: a ubatch over several streams rebuilds its layouts in set_input_qsa, with block ids
+    // that do not match the cached ones, so it pools every block of each stream into its rows without trusting them
+    if (n_ns != 1 && !qsa_layout_streams()) {
         for (uint32_t s = strm; s < strm + n_ns; ++s) {
             for (const uint32_t r : qsa_ratios) {
                 qsa_keys[qsa_key(s, r)].valid = false;
@@ -1315,7 +1362,11 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
         return;
     }
 
-    auto & rm_strm = qsa_rm_cells[strm];
+    // keep the removals for the other ratios: set_input_qsa consumes them
+    std::vector<std::vector<uint32_t>> rm_save(n_ns);
+    for (uint32_t s = 0; s < n_ns; ++s) {
+        rm_save[s] = qsa_rm_cells[strm + s];
+    }
 
     std::vector<int32_t> cell_blk_v;
     std::vector<int32_t> blk_cells_v;
@@ -1324,10 +1375,17 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
     bool skipped = false;
 
     // LLAMA_QSA_BLK_STATS: how often a ratio's block keys come from the cache, are all pooled again because the layout
-    // was rebuilt or because more blocks changed than the graph re-pools, or are pooled with no cache at all
-    static const bool stats = getenv("LLAMA_QSA_BLK_STATS") != nullptr;
-    static int64_t n_stat[4] = {};
-    static int64_t n_stat_calls = 0;
+    // was rebuilt or because more blocks changed than the graph re-pools, or are pooled with no cache at all;
+    // ubatches over one stream and over several, and prompt and decode/verify ubatches, are counted apart
+    int64_t * st = qsa_stat[n_ns == 1 ? 0 : 1][ubatch.n_tokens/n_ns <= QSA_STAT_DECODE_MAX ? 1 : 0];
+
+    struct strm_keys {
+        uint64_t gen   = 0;
+        int32_t  n_bid = 0;
+        std::vector<int32_t> * dirty = nullptr;
+        bool same = false;
+    };
+    std::vector<strm_keys> sk(n_ns);
 
     for (const uint32_t r : qsa_ratios) {
         qsa_blk_plan & plan = plans[r];
@@ -1341,94 +1399,162 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
 
         const int64_t n_blocks = (n_kv + r - 1)/r;
 
-        cell_blk_v .resize(n_kv);
-        blk_cells_v.resize(r*n_blocks);
-        blk_pos_v  .resize(4*n_blocks);
+        cell_blk_v .resize(n_kv*n_ns);
+        blk_cells_v.resize(r*n_blocks*n_ns);
+        blk_pos_v  .resize(4*n_blocks*n_ns);
 
         ggml_tensor t_cell_blk  = {};
         ggml_tensor t_blk_cells = {};
         ggml_tensor t_blk_pos   = {};
-        t_cell_blk .ne[0] = n_kv;       t_cell_blk .ne[1] = 1; t_cell_blk .data = cell_blk_v .data();
-        t_blk_cells.ne[0] = r*n_blocks; t_blk_cells.ne[1] = 1; t_blk_cells.data = blk_cells_v.data();
-        t_blk_pos  .ne[0] = 4*n_blocks; t_blk_pos  .ne[1] = 1; t_blk_pos  .data = blk_pos_v  .data();
+        t_cell_blk .ne[0] = n_kv;            t_cell_blk .ne[1] = n_ns; t_cell_blk .data = cell_blk_v .data();
+        t_blk_cells.ne[0] = r*n_blocks;      t_blk_cells.ne[1] = n_ns; t_blk_cells.data = blk_cells_v.data();
+        t_blk_pos  .ne[0] = 4*n_blocks*n_ns; t_blk_pos  .ne[1] = 1;    t_blk_pos  .data = blk_pos_v  .data();
 
-        // keep the removals for the other ratios: set_input_qsa consumes them
-        const uint32_t key = qsa_key(strm, r);
-        const std::vector<uint32_t> rm = rm_strm;
         set_input_qsa(&t_cell_blk, &t_blk_cells, &t_blk_pos, nullptr, &ubatch, r, true, lo);
-        rm_strm = rm;
-        qsa_fresh[key] = true;
-
-        // the layout the update used, if it keeps block ids from step to step
-        const int kind = qsa_last_kind[key];
-        uint64_t gen   = 0;
-        int32_t  n_bid = 0;
-        std::vector<int32_t> * dirty = nullptr;
-        if (kind == 1) {
-            auto & L = qsa_layouts.at(key);
-            gen = L.gen; n_bid = (int32_t) L.bid_idx.size(); dirty = &L.dirty;
-        } else if (kind == 2) {
-            auto & L = qsa_layouts_ms.at(key);
-            gen = L.gen; n_bid = (int32_t) L.bid_idx.size(); dirty = &L.dirty;
-        }
-        plan.kind = kind;
-        plan.strm = strm;
-        plan.gen  = gen;
-
-        qsa_key_state & ks = qsa_keys[key];
 
         plan.n_re = (int32_t) (ubatch.n_tokens/r + 2*ubatch.n_seqs_unq + 2);
+        plan.strms.assign(n_ns, {});
+        plan.bids.clear();
+        plan.bid_s.clear();
 
-        if (gen == 0) {
-            // no layout that keeps block ids: pool everything, no cache
-            ks.valid = false;
-            plan.mode = 0;
-            n_stat[0]++;
+        // mode 2 needs every stream on the layout its keys were pooled with; it then re-pools the new blocks and the
+        // ones whose cells were rewritten, of all streams together, in the n_re slots
+        bool all_same = n_ns == 1 || qsa_mode2_streams();
+        bool any_gen  = false;
+        bool no_gen   = false;
+
+        for (uint32_t s = 0; s < n_ns; ++s) {
+            qsa_rm_cells[strm + s] = rm_save[s];
+
+            const uint32_t key = qsa_key(strm + s, r);
+            qsa_fresh[key] = true;
+
+            // the layout the update used, if it keeps block ids from step to step
+            const int kind = qsa_last_kind[key];
+            auto & k = sk[s];
+            k = {};
+            if (kind == 1) {
+                auto & L = qsa_layouts.at(key);
+                k.gen = L.gen; k.n_bid = (int32_t) L.bid_idx.size(); k.dirty = &L.dirty;
+            } else if (kind == 2) {
+                auto & L = qsa_layouts_ms.at(key);
+                k.gen = L.gen; k.n_bid = (int32_t) L.bid_idx.size(); k.dirty = &L.dirty;
+            }
+            plan.strms[s] = { strm + s, kind, k.gen };
+
+            if (k.gen == 0) {
+                no_gen   = true;
+                all_same = false;
+                continue;
+            }
+            any_gen = true;
+
+            const qsa_key_state & ks = qsa_keys[key];
+            k.same = ks.valid && ks.gen == k.gen && ks.n_keyed <= k.n_bid;
+            if (!k.same) {
+                all_same = false;
+                continue;
+            }
+
+            const size_t b0 = plan.bids.size();
+            for (int32_t b = ks.n_keyed; b < k.n_bid; ++b) {
+                plan.bids.push_back(b);
+            }
+            for (const int32_t b : *k.dirty) {
+                if (b < ks.n_keyed) {
+                    plan.bids.push_back(b);
+                }
+            }
+            std::sort(plan.bids.begin() + b0, plan.bids.end());
+            plan.bids.erase(std::unique(plan.bids.begin() + b0, plan.bids.end()), plan.bids.end());
+            plan.bid_s.resize(plan.bids.size(), s);
+        }
+
+        // LLAMA_QSA_BLK_VERIFY: keep a copy of the rows mode 2 would trust, then pool every block instead (mode 1 below)
+        bool verify_now = false;
+        if (all_same && (int32_t) plan.bids.size() <= plan.n_re && qsa_blk_verify() > 0 && can_read &&
+                ++qsa_verify_seen % qsa_blk_verify() == 0) {
+            verify_now = true;
+            for (const auto & [il, rl] : qsa_blk_ratio) {
+                if (rl != r) {
+                    continue;
+                }
+                const ggml_tensor * t = qsa_blk_k.at(il);
+                for (uint32_t s = 0; s < n_ns; ++s) {
+                    const int32_t n_keyed = qsa_keys[qsa_key(strm + s, r)].n_keyed;
+                    if (n_keyed <= 0) {
+                        continue;
+                    }
+                    qsa_verify_rows v;
+                    v.il   = il;
+                    v.strm = strm + s;
+                    v.skip.assign(n_keyed, false);
+                    for (size_t i = 0; i < plan.bids.size(); ++i) {
+                        if (plan.bid_s[i] == s && plan.bids[i] < n_keyed) {
+                            v.skip[plan.bids[i]] = true;
+                        }
+                    }
+                    v.keys.resize((size_t) n_keyed*t->ne[0]);
+                    ggml_backend_tensor_get(t, v.keys.data(), (strm + s)*t->nb[2], v.keys.size()*sizeof(float));
+                    qsa_verify_pending.push_back(std::move(v));
+                }
+            }
+        }
+
+        if (all_same && (int32_t) plan.bids.size() <= plan.n_re && !verify_now) {
+            plan.mode = 2;
+            for (uint32_t s = 0; s < n_ns; ++s) {
+                qsa_keys[qsa_key(strm + s, r)].n_keyed = sk[s].n_bid;
+                sk[s].dirty->clear();
+            }
+            st[3]++;
             continue;
         }
 
-        const bool same_layout = ks.valid && ks.gen == gen && ks.n_keyed <= n_bid;
-        if (same_layout) {
-            std::vector<int32_t> bids;
-            for (int32_t b = ks.n_keyed; b < n_bid; ++b) {
-                bids.push_back(b);
-            }
-            for (const int32_t b : *dirty) {
-                if (b < ks.n_keyed) {
-                    bids.push_back(b);
+        // a new layout or none, more blocks to re-pool than the graph's slots, or per-stream mode 2 turned off: pool
+        // every block of every stream and refresh the cache. a stream with a layout that keeps block ids trusts its rows
+        // from now on; one without pools without trusting them
+        plan.mode = any_gen ? 1 : 0;
+        plan.bids.clear();
+        plan.bid_s.clear();
+        bool any_new = false;
+        for (uint32_t s = 0; s < n_ns; ++s) {
+            const uint32_t  key = qsa_key(strm + s, r);
+            qsa_key_state & ks  = qsa_keys[key];
+            if (sk[s].gen == 0) {
+                ks.valid = false;
+                // the keys are re-pooled in full, so the blocks the removals marked need no extra pass
+                auto it1 = qsa_layouts.find(key);
+                if (it1 != qsa_layouts.end()) {
+                    it1->second.dirty.clear();
                 }
-            }
-            std::sort(bids.begin(), bids.end());
-            bids.erase(std::unique(bids.begin(), bids.end()), bids.end());
-
-            if ((int32_t) bids.size() <= plan.n_re) {
-                plan.mode = 2;
-                plan.bids = std::move(bids);
-                ks.n_keyed = n_bid;
-                dirty->clear();
-                n_stat[3]++;
+                auto it2 = qsa_layouts_ms.find(key);
+                if (it2 != qsa_layouts_ms.end()) {
+                    it2->second.dirty.clear();
+                }
                 continue;
             }
+            any_new   |= !sk[s].same;
+            ks.valid   = true;
+            ks.gen     = sk[s].gen;
+            ks.n_keyed = sk[s].n_bid;
+            sk[s].dirty->clear();
         }
-
-        // a new layout, or more blocks to re-pool than the graph's slots: pool every block and refresh the cache
-        plan.mode  = 1;
-        ks.valid   = true;
-        ks.gen     = gen;
-        ks.n_keyed = n_bid;
-        dirty->clear();
-        n_stat[same_layout ? 2 : 1]++;
+        if (!verify_now) {
+            st[no_gen && !any_gen ? 0 : any_new || no_gen ? 1 : 2]++;
+        }
     }
 
-    if (stats && ++n_stat_calls % 256 == 0) {
-        LLAMA_LOG_WARN("%s: %" PRId64 " ubatches: cache %" PRId64 ", full pool on new layout %" PRId64 ", on overflow %" PRId64 ", no cache %" PRId64 "\n",
-                __func__, n_stat_calls, n_stat[3], n_stat[1], n_stat[2], n_stat[0]);
+    if (qsa_blk_stats() && ++qsa_stat_calls % 256 == 0) {
+        qsa_stats_print(__func__);
     }
 
     // every ratio's layout has seen the removals, so set_input_qsa for this ubatch finds nothing new. a ratio that
     // skipped its update keeps them for the next one: a layout that comes back must still see its rewritten cells
     if (!skipped) {
-        rm_strm.clear();
+        for (uint32_t s = 0; s < n_ns; ++s) {
+            qsa_rm_cells[strm + s].clear();
+        }
     }
     qsa_rm_keep = skipped;
 }
@@ -1441,35 +1567,49 @@ void llama_memory_hybrid_idx::set_input_qsa_re(ggml_tensor * re_cells, ggml_tens
 
     const int64_t r    = ratio;
     const int64_t n_re = re_ids->ne[0];
-    GGML_ASSERT((int64_t) plan.bids.size() <= n_re);
+    GGML_ASSERT((int64_t) plan.bids.size() <= n_re && plan.bid_s.size() == plan.bids.size());
+    GGML_ASSERT(!plan.strms.empty());
 
-    // the layout qsa_prepare planned with
-    GGML_ASSERT(plan.kind == 1 || plan.kind == 2);
-    const uint32_t               key       = qsa_key(plan.strm, ratio);
-    const std::vector<int32_t> & blk_cells = plan.kind == 1 ? qsa_layouts.at(key).blk_cells : qsa_layouts_ms.at(key).blk_cells;
-    const std::vector<int32_t> & bid_idx   = plan.kind == 1 ? qsa_layouts.at(key).bid_idx   : qsa_layouts_ms.at(key).bid_idx;
-    const uint64_t               gen       = plan.kind == 1 ? qsa_layouts.at(key).gen       : qsa_layouts_ms.at(key).gen;
-    GGML_ASSERT(gen == plan.gen && "qsa: the block-key plan lost its layout");
+    // the layouts qsa_prepare planned with
+    struct strm_view {
+        const std::vector<int32_t> * blk_cells;
+        const std::vector<int32_t> * bid_idx;
+    };
+    std::vector<strm_view> sv(plan.strms.size());
+    for (size_t i = 0; i < plan.strms.size(); ++i) {
+        const auto & ps = plan.strms[i];
+        GGML_ASSERT(ps.kind == 1 || ps.kind == 2);
+        const uint32_t key = qsa_key(ps.strm, ratio);
+        const uint64_t gen = ps.kind == 1 ? qsa_layouts.at(key).gen : qsa_layouts_ms.at(key).gen;
+        GGML_ASSERT(gen == ps.gen && "qsa: the block-key plan lost its layout");
+        sv[i].blk_cells = ps.kind == 1 ? &qsa_layouts.at(key).blk_cells : &qsa_layouts_ms.at(key).blk_cells;
+        sv[i].bid_idx   = ps.kind == 1 ? &qsa_layouts.at(key).bid_idx   : &qsa_layouts_ms.at(key).bid_idx;
+    }
 
     int32_t * d_cells = (int32_t *) re_cells->data;
     int32_t * d_pos   = (int32_t *) re_pos->data;
     int64_t * d_ids   = (int64_t *) re_ids->data;
 
-    // the padding slots re-pool block 0 into the spare last row of the stream's cache rows
-    const int64_t n_rows = (int64_t) mem_idx->get_size()/r + 1;
-    const int64_t row0   = (int64_t) plan.strm*n_rows;
+    // members are rows of the ubatch's streams laid flat: stream strm + i starts at row i*kv_size
+    const int64_t kv_size = mem_idx->get_size();
+
+    // the padding slots re-pool block 0 of the first stream into the spare last row of its cache rows
+    const int64_t n_rows = (int64_t) kv_size/r + 1;
     const int64_t spare  = n_rows - 1;
     for (int64_t k = 0; k < n_re; ++k) {
         const bool    real = k < (int64_t) plan.bids.size();
-        const int32_t b    = real ? plan.bids[k] : 0;
+        const int32_t b    = real ? plan.bids[k]  : 0;
+        const size_t  i    = real ? plan.bid_s[k] : 0;
+        const auto &  bc   = *sv[i].blk_cells;
+        const auto &  bi   = *sv[i].bid_idx;
         for (int64_t m = 0; m < r; ++m) {
-            d_cells[k*r + m] = blk_cells[b*r + m];
+            d_cells[k*r + m] = (int32_t) (i*kv_size) + bc[b*r + m];
         }
-        const int32_t p = (b < (int32_t) bid_idx.size() ? bid_idx[b] : 0) + (int32_t) qsa_pos_off;
+        const int32_t p = (b < (int32_t) bi.size() ? bi[b] : 0) + (int32_t) qsa_pos_off;
         for (int64_t sec = 0; sec < 4; ++sec) {
             d_pos[sec*n_re + k] = p;
         }
-        d_ids[k] = row0 + (real ? b : spare);
+        d_ids[k] = (int64_t) plan.strms[i].strm*n_rows + (real ? b : spare);
     }
 }
 
