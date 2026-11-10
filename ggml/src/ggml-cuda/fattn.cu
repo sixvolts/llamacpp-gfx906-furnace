@@ -873,7 +873,7 @@ static constexpr int FATTN_DEC_MAX_Q = 16;  // query rows per launch (verify bat
 static constexpr int FATTN_DEC_PF_ROWS = 64; // prompt rows per launch on the sparse prompt path (bounds the partials)
 
 template <int D, int G>
-static __global__ void __launch_bounds__(256) fattn_dec_chunk(
+static __global__ void __launch_bounds__(256, D == 256 && G == 12 ? 2 : 1) fattn_dec_chunk(
         const float * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V, const half * __restrict__ mask,
         const int32_t * __restrict__ idx, const int n_keys, const float scale,
         const int64_t q_sh, const int64_t nb11, const int64_t nb12, const int64_t nb21, const int64_t nb22,
